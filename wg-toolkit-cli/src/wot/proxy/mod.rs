@@ -12,7 +12,7 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 use flate2::read::ZlibDecoder;
 use blowfish::Blowfish;
 
-use wgtk::net::element::{DebugElementUndefined, DebugElementVariable16, Element, SimpleElement};
+use wgtk::net::element::{DebugElementUndefined, DebugElementVariable16, DebugElementVariable32, Element, SimpleElement, REPLY_ID};
 use wgtk::net::bundle::{Bundle, NextElementReader, ElementReader};
 use wgtk::net::codec::WgSocketAddrV4;
 
@@ -722,10 +722,19 @@ impl BaseHandler {
                     }
                 }
                 NextElementReader::Reply(reply) => {
+                    // `InterfaceElement::REPLY` is a variable-length message with a
+                    // 4-byte length, which is exactly what `DebugElementVariable32` reads,
+                    // so taking the body verbatim leaves the reader on the next element.
+                    // This used to `break` instead, dropping the rest of the bundle for a
+                    // payload whose *type* is unknown -- a decoding gap, not a framing one.
+                    // `UDPBundleProcessor::dispatchMessages` draws the same line: it warns
+                    // when a reply handler leaves bytes behind, and keeps iterating.
+                    //
+                    // Both sides log their request id, so pairing a reply with the request
+                    // it answers is a join over the trace, not state to keep here.
                     let request_id = reply.request_id();
-                    let _elt = reply.read_simple::<()>()?;
-                    warn!(addr = %peer.addr(), request_id, "-> Reply (unknown payload length, bundle reading stopped here)");
-                    break;
+                    let body = reply.read_simple::<DebugElementVariable32<REPLY_ID>>()?;
+                    info!(addr = %peer.addr(), request_id, "-> Reply (undecoded): {body:?}");
                 }
             }
         }
@@ -874,10 +883,19 @@ impl BaseHandler {
                     }
                 }
                 NextElementReader::Reply(reply) => {
+                    // `InterfaceElement::REPLY` is a variable-length message with a
+                    // 4-byte length, which is exactly what `DebugElementVariable32` reads,
+                    // so taking the body verbatim leaves the reader on the next element.
+                    // This used to `break` instead, dropping the rest of the bundle for a
+                    // payload whose *type* is unknown -- a decoding gap, not a framing one.
+                    // `UDPBundleProcessor::dispatchMessages` draws the same line: it warns
+                    // when a reply handler leaves bytes behind, and keeps iterating.
+                    //
+                    // Both sides log their request id, so pairing a reply with the request
+                    // it answers is a join over the trace, not state to keep here.
                     let request_id = reply.request_id();
-                    let _elt = reply.read_simple::<()>()?;
-                    warn!(addr = %peer.addr(), request_id, "<- Reply (unknown payload length, bundle reading stopped here)");
-                    break;
+                    let body = reply.read_simple::<DebugElementVariable32<REPLY_ID>>()?;
+                    info!(addr = %peer.addr(), request_id, "<- Reply (undecoded): {body:?}");
                 }
             }
         }
