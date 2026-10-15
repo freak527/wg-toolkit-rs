@@ -731,9 +731,16 @@ impl BaseHandler {
         // Worth a warning rather than silence: this is the same exposed-id table the rest
         // of dispatch relies on, so a mismatch here is evidence about that table.
         if let Some(stop) = &decoded.stopped {
+            // The ids that *did* decode are the diagnosis, not noise: they say whether the
+            // run was walking the table correctly right up to the stop (so the table is
+            // simply short) or had already drifted (so an earlier property's length is
+            // wrong). See `ChangedProperties` for why ascending ids make that readable.
+            let got: Vec<String> = decoded.values.iter()
+                .map(|(id, name, _)| format!("{id}:{name}")).collect();
             warn!(%addr, rest = %hex(&stop.rest),
                 "entity {entity_id} (type 0x{type_id:02X}) initial properties stopped early: \
-                 kept {} of {}, {}", decoded.values.len(), stop.expected, stop.reason);
+                 kept {} of {} [{}], {}",
+                decoded.values.len(), stop.expected, got.join(" "), stop.reason);
         }
 
         if decoded.values.is_empty() {

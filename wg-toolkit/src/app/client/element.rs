@@ -518,6 +518,16 @@ pub struct CreateEntity {
     /// default `HALFPITCH = true`) -- decode with [`PackedYawPitchRoll::unpack`]
     /// passing `half_pitch = false`.
     pub direction: PackedYawPitchRoll,
+    /// The byte WoT sends immediately after a packed yaw/pitch/roll, meaning unknown.
+    ///
+    /// Not part of [`PackedYawPitchRoll`], whose three bytes are confirmed by the fixed
+    /// element lengths of the whole `AVATAR_UPDATE_*` family: every `*_YAW_PITCH_ROLL`
+    /// variant there is exactly one byte longer than its three packed bytes account for,
+    /// and those lengths decode live. `CreateEntity` simply never had the extra byte
+    /// modelled, which shifted [`Self::client_data`] one byte early and made every
+    /// `CreateEntity` payload undecodable -- `CreateEntityDetailed`, whose direction is
+    /// three raw floats with no such byte, was unaffected and decoded fine all along.
+    pub direction_unk: u8,
     /// The entity's initial client-visible property values, still encoded -- decode with
     /// [`Self::client_properties`] against this entity type's own property table.
     ///
@@ -578,6 +588,7 @@ impl SimpleCodec for CreateEntity {
         write.write_string_variable(&self.resource_name)?;
         write.write_vec3(self.position)?;
         SimpleCodec::write(&self.direction, write)?;
+        write.write_u8(self.direction_unk)?;
         write.write_all(&self.client_data)
     }
 
@@ -590,9 +601,10 @@ impl SimpleCodec for CreateEntity {
         let resource_name = read.read_string_variable_lossy()?;
         let position = read.read_vec3()?;
         let direction = SimpleCodec::read(read)?;
+        let direction_unk = read.read_u8()?;
         let mut client_data = Vec::new();
         read.read_to_end(&mut client_data)?;
-        Ok(Self { entity_id, entity_type_id, unk_u16, resource_name, position, direction, client_data })
+        Ok(Self { entity_id, entity_type_id, unk_u16, resource_name, position, direction, direction_unk, client_data })
     }
 
 }
@@ -2285,6 +2297,7 @@ fn read_changed_properties(data: &[u8], properties: &[PropertyDef]) -> ChangedPr
     // Where the offending property *starts*, so `rest` is cut from there rather than from
     // wherever a half-read value happened to leave the cursor.
     let mut stop: Option<(usize, String)> = None;
+    let mut last_id: Option<u8> = None;
 
     for _ in 0..count {
 
@@ -2295,6 +2308,23 @@ fn read_changed_properties(data: &[u8], properties: &[PropertyDef]) -> ChangedPr
             Err(e) => { stop = Some((at, format!("reading the next exposed id: {e}"))); break }
         };
 
+        // `addChangedProperties` walks `i` from 0 to `clientServerPropertyCount()` and
+        // writes `uint8(i)` for each property it sends, so the ids in a run are strictly
+        // ascending. A repeat or a step backwards therefore isn't an id at all -- it is a
+        // value byte being read at the wrong offset, i.e. an earlier property whose type
+        // we size differently from the server.
+        //
+        // Worth checking separately from the bounds test below: a desync that happens to
+        // land on an *in-range* id would otherwise decode "successfully" and seed garbage
+        // into the caller's tracked state, which is far worse than reporting nothing.
+        if last_id.is_some_and(|last| exposed_id <= last) {
+            stop = Some((at, format!(
+                "exposed id {exposed_id} after {} -- ids are written in ascending order, so \
+                 this is a desync from an earlier property's length, not a new property",
+                last_id.unwrap())));
+            break;
+        }
+
         let Some(property) = properties.get(exposed_id as usize) else {
             stop = Some((at, format!(
                 "exposed id {exposed_id} past the end of a {}-entry property table",
@@ -2303,7 +2333,10 @@ fn read_changed_properties(data: &[u8], properties: &[PropertyDef]) -> ChangedPr
         };
 
         match Value::read(&mut cursor, &property.ty) {
-            Ok(value) => values.push((exposed_id, Arc::clone(&property.name), value)),
+            Ok(value) => {
+                last_id = Some(exposed_id);
+                values.push((exposed_id, Arc::clone(&property.name), value));
+            }
             Err(e) => { stop = Some((at, format!("property {} (exposed id {exposed_id}): {e}", property.name))); break }
         }
 
@@ -2786,6 +2819,40 @@ mod tests {
         (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
     }
 
+    /// `CreateEntity` must consume *four* bytes of direction, not three, or `client_data`
+    /// starts one byte early and the whole property run is garbage.
+    ///
+    /// The run here is the head of a real `Vehicle` create from a live battle. Aligned
+    /// correctly it starts with its count (`0x0a`, ten properties) and then ascending
+    /// exposed ids; one byte early, that count reads as the trailing direction byte
+    /// instead and everything after it is nonsense. See [`CreateEntity::direction_unk`].
+    #[test]
+    fn create_entity_direction_carries_a_trailing_byte() {
+
+        let run = "0a010105010b010d2a800e2c010f0100";
+        let body = const_hex(&format!(
+            "00\
+             00000000\
+             0600\
+             0000\
+             0a62772e64656661756c74\
+             000000000000000000000000\
+             010203\
+             07\
+             {run}"));
+
+        let create = <CreateEntity as SimpleCodec>::read(&mut &body[..]).unwrap();
+
+        assert_eq!(create.entity_type_id, 6);
+        assert_eq!(create.resource_name, "bw.default");
+        assert_eq!(create.direction.0, [0x01, 0x02, 0x03]);
+        assert_eq!(create.direction_unk, 0x07);
+        // The payload must begin at the run's count byte, not one byte before it.
+        assert_eq!(create.client_data, const_hex(run));
+        assert_eq!(create.client_data[0], 0x0a, "the real count: ten properties");
+
+    }
+
     fn test_properties() -> (Vec<PropertyDef>, Ty, Ty, Ty) {
         let mut sys = TySystem::default();
         let u8_ty = sys.find("UINT8").unwrap();
@@ -2885,6 +2952,29 @@ mod tests {
         assert!(stop.reason.contains("exposed id 98"), "{}", stop.reason);
         // Cut from the start of the offending property, not mid-value.
         assert_eq!(stop.rest, const_hex("62deadbeef"));
+
+    }
+
+    /// A desync that lands on an *in-range* id must still be caught, by the ascending-id
+    /// rule -- otherwise it seeds a real property name with a garbage value.
+    #[test]
+    fn changed_properties_catch_a_backwards_id() {
+
+        let mut sys = TySystem::default();
+        let i32_ty = sys.find("INT32").unwrap();
+        let properties = vec![
+            PropertyDef { name: Arc::from("a"), ty: i32_ty.clone(), length: ElementLength::Fixed(4) },
+            PropertyDef { name: Arc::from("b"), ty: i32_ty, length: ElementLength::Fixed(4) },
+        ];
+
+        // Two properties, but the second id repeats the first. `addChangedProperties`
+        // walks `i` upwards, so this cannot be a real run.
+        let data = const_hex("0200e72989000000000001");
+        let decoded = read_changed_properties(&data, &properties);
+
+        assert_eq!(decoded.values.len(), 1, "only the property before the desync");
+        let stop = decoded.stopped.expect("a backwards id must be reported");
+        assert!(stop.reason.contains("desync"), "{}", stop.reason);
 
     }
 
