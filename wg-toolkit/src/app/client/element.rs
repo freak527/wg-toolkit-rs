@@ -519,7 +519,7 @@ pub struct CreateEntity {
     /// passing `half_pitch = false`.
     pub direction: PackedYawPitchRoll,
     /// The entity's initial client-visible property values, still encoded -- decode with
-    /// [`read_changed_properties`] against this entity type's own property table.
+    /// [`Self::client_properties`] against this entity type's own property table.
     ///
     /// Carried raw because this element's codec is reached without a dispatch table (the
     /// entity's type id is only read *here*, from the same payload). Not a positional dict
@@ -552,6 +552,20 @@ fn read_compressed(read: &mut dyn Read) -> io::Result<Vec<u8>> {
              zlib) -- the stream is most likely desynced, not compressed with something new"))),
     }
     Ok(body)
+}
+
+impl CreateEntity {
+
+    /// Decode [`Self::client_data`] against this entity type's property table, giving the
+    /// entity's initial property values -- the same `(exposed id, value)` run that
+    /// [`UpdateEntity`] carries later.
+    ///
+    /// The table is a parameter rather than a field because this element's codec is
+    /// reached before any table can be chosen: [`Self::entity_type_id`] is read *here*.
+    pub fn client_properties(&self, properties: &[PropertyDef]) -> ChangedProperties {
+        read_changed_properties(&self.client_data, properties)
+    }
+
 }
 
 impl SimpleCodec for CreateEntity {
@@ -610,6 +624,20 @@ pub struct CreateEntityDetailed {
     pub direction: Vec3,
     /// See [`CreateEntity::client_data`].
     pub client_data: Vec<u8>,
+}
+
+impl CreateEntityDetailed {
+
+    /// Decode [`Self::client_data`] against this entity type's property table, giving the
+    /// entity's initial property values -- the same `(exposed id, value)` run that
+    /// [`UpdateEntity`] carries later.
+    ///
+    /// The table is a parameter rather than a field because this element's codec is
+    /// reached before any table can be chosen: [`Self::entity_type_id`] is read *here*.
+    pub fn client_properties(&self, properties: &[PropertyDef]) -> ChangedProperties {
+        read_changed_properties(&self.client_data, properties)
+    }
+
 }
 
 impl SimpleCodec for CreateEntityDetailed {
@@ -2185,51 +2213,118 @@ fn decode_compressed_path(
 
 }
 
+/// What a run of client-visible property values decoded to, whole or not.
+///
+/// Decoding stops at the first exposed id the property table doesn't cover, or the first
+/// value that doesn't read. Stopping is forced: an unknown id means an unknown *size*, so
+/// every byte after it is unreadable. But the properties *before* that point are real, so
+/// they are kept rather than discarded with the rest -- a `Vehicle` whose table is missing
+/// its dynamic components still seeds the properties it does have, which is what later
+/// gives a compressed path a live `Array` length to resolve against.
+#[derive(Debug, Clone, Default)]
+pub struct ChangedProperties {
+    /// Everything that decoded, in wire order, as `(exposed id, name, value)`. Possibly
+    /// empty: a payload with nothing to send carries no bytes at all.
+    pub values: Vec<(u8, Arc<str>, Value)>,
+    /// Set when the run did *not* decode cleanly to its declared count.
+    pub stopped: Option<ChangedPropertiesStop>,
+}
+
+impl ChangedProperties {
+    /// Whether the whole run decoded and consumed the payload exactly.
+    pub fn is_complete(&self) -> bool {
+        self.stopped.is_none()
+    }
+}
+
+/// Why a [`ChangedProperties`] run didn't decode cleanly, and what was left over.
+#[derive(Debug, Clone)]
+pub struct ChangedPropertiesStop {
+    pub reason: String,
+    /// What the count byte promised; compare against [`ChangedProperties::values`]'s
+    /// length for how many were actually recovered.
+    pub expected: u8,
+    /// From the stopping point to the end of the payload, kept for logging -- these bytes
+    /// are the evidence for whatever the property table is missing.
+    pub rest: Vec<u8>,
+}
+
 /// Decode a run of client-visible property values written by the real engine's
 /// `EntityCache::addChangedProperties` (`cellapp/entity_cache.cpp`): a `uint8` count,
 /// then that many `(uint8 exposed id, value)` pairs. An empty payload is valid and
-/// decodes to no values -- see the `len == 0` case below.
+/// decodes to no values -- see the `is_empty` case below.
 ///
 /// The ids index `EntityDescription::clientServerProperty(i)` -- the very table
 /// [`crate::app::dispatch::EntityDispatch::properties`] reproduces -- so a decode here is
 /// also a check on that table. This is the body of both [`CreateEntity::client_data`]
-/// (the entity's initial values, via `addOuterDetailLevel`) and `updateEntity` (a later
-/// detail level's, or a refresh).
+/// (the entity's initial values, via `addOuterDetailLevel`) and [`UpdateEntity`] (a later
+/// detail level's, or a refresh); reach it through [`CreateEntity::client_properties`] or
+/// by reading the element, rather than calling it directly.
 ///
 /// Confirmed byte-exact against a live capture: a `SPGZone` create carried
 /// `04 00 <vehicleID> 01 <equipmentID> 02 <launchTime> 03 <strikeTime>`, consuming the
 /// payload to its last byte, with `strikeTime` exactly 6.0s after `launchTime`.
-pub fn read_changed_properties(
-    read: &mut dyn Read,
-    properties: &[PropertyDef],
-    len: usize,
-) -> io::Result<Vec<(u8, Arc<str>, Value)>> {
+///
+/// Never fails: anything it can't read becomes a [`ChangedPropertiesStop`] alongside
+/// whatever did read, because a partially understood entity is still worth seeding and a
+/// malformed run must not abort the bundle around it.
+fn read_changed_properties(data: &[u8], properties: &[PropertyDef]) -> ChangedProperties {
 
     // An empty payload is valid and means "nothing changed": `addChangedProperties`
     // returns *before* writing the count when it finds nothing to send, and the client
     // matches that with `if (!data.remainingLength()) return;` in `BWEntity::onProperties`.
     // So the count byte is absent, not zero.
-    if len == 0 {
-        return Ok(Vec::new());
-    }
+    let Some(&count) = data.first() else {
+        return ChangedProperties::default();
+    };
 
-    let count = read.read_u8()?;
-    let mut out = Vec::with_capacity(count as usize);
+    let mut cursor = io::Cursor::new(data);
+    cursor.set_position(1);
+
+    let mut values = Vec::with_capacity(count as usize);
+    // Where the offending property *starts*, so `rest` is cut from there rather than from
+    // wherever a half-read value happened to leave the cursor.
+    let mut stop: Option<(usize, String)> = None;
 
     for _ in 0..count {
-        let exposed_id = read.read_u8()?;
-        let Some(property) = properties.get(exposed_id as usize) else {
-            // Reading on would decode the rest against the wrong types, so stop with the
-            // ids recovered so far rather than inventing values.
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
-                "changed properties: exposed id {exposed_id} past the end of a {}-entry \
-                 property table", properties.len())));
+
+        let at = cursor.position() as usize;
+
+        let exposed_id = match cursor.read_u8() {
+            Ok(id) => id,
+            Err(e) => { stop = Some((at, format!("reading the next exposed id: {e}"))); break }
         };
-        let value = Value::read(read, &property.ty)?;
-        out.push((exposed_id, Arc::clone(&property.name), value));
+
+        let Some(property) = properties.get(exposed_id as usize) else {
+            stop = Some((at, format!(
+                "exposed id {exposed_id} past the end of a {}-entry property table",
+                properties.len())));
+            break;
+        };
+
+        match Value::read(&mut cursor, &property.ty) {
+            Ok(value) => values.push((exposed_id, Arc::clone(&property.name), value)),
+            Err(e) => { stop = Some((at, format!("property {} (exposed id {exposed_id}): {e}", property.name))); break }
+        }
+
     }
 
-    Ok(out)
+    // A clean run consumes the payload exactly, so leftovers mean the table drifted from
+    // the server's even though every id in it happened to resolve. Worth the same report.
+    let at = cursor.position() as usize;
+    if stop.is_none() && at < data.len() {
+        stop = Some((at, format!(
+            "{} trailing bytes after the {count} declared properties", data.len() - at)));
+    }
+
+    ChangedProperties {
+        values,
+        stopped: stop.map(|(at, reason)| ChangedPropertiesStop {
+            reason,
+            expected: count,
+            rest: data[at.min(data.len())..].to_vec(),
+        }),
+    }
 
 }
 
@@ -2371,7 +2466,7 @@ impl Element<PropertyPathConfig<'_>> for SliceEntityProperty {
 
 /// A client-directed update carrying whole values for one or more of the *selected*
 /// entity's client-visible properties -- the same `(exposed id, value)` run that an
-/// entity's creation payload carries, see [`read_changed_properties`].
+/// entity's creation payload carries, see [`ChangedProperties`].
 ///
 /// Written by the same `EntityCache::addChangedProperties` as [`CreateEntity::client_data`],
 /// just with a bundle header instead of inside the create: the engine sends it when an
@@ -2380,14 +2475,7 @@ impl Element<PropertyPathConfig<'_>> for SliceEntityProperty {
 /// `ServerConnection::updateEntity` applies it to `selectedEntityID_`, so it is targeted
 /// by the preceding `SelectEntity`/`SelectPlayerEntity`, exactly like `ENTITY_PROPERTY`.
 #[derive(Debug, Clone)]
-pub enum UpdateEntity {
-    /// Every property in the run, as `(exposed id, name, value)`. Possibly empty: a
-    /// payload with nothing to send carries no bytes at all.
-    Known(Vec<(u8, Arc<str>, Value)>),
-    /// The run could not be decoded -- same contract as [`SliceEntityProperty::Unknown`],
-    /// including why this is not an `Err`.
-    Unknown { data: Vec<u8>, reason: String },
-}
+pub struct UpdateEntity(pub ChangedProperties);
 
 impl UpdateEntity {
     pub const ID: u8 = id::UPDATE_ENTITY;
@@ -2410,10 +2498,7 @@ impl Element<[PropertyDef]> for UpdateEntity {
     fn read(read: &mut dyn Read, config: &[PropertyDef], len: usize, _id: u8) -> io::Result<Self> {
         let mut data = vec![0u8; len];
         read.read_exact(&mut data)?;
-        match read_changed_properties(&mut &data[..], config, len) {
-            Ok(values) => Ok(Self::Known(values)),
-            Err(e) => Ok(Self::Unknown { data, reason: e.to_string() }),
-        }
+        Ok(Self(read_changed_properties(&data, config)))
     }
 
 }
@@ -2744,10 +2829,10 @@ mod tests {
         ];
 
         let data = const_hex("0400e729890001e53600000266666666b66601410366666666e6660141");
-        let mut read = &data[..];
-        let values = read_changed_properties(&mut read, &properties, data.len()).unwrap();
+        let decoded = read_changed_properties(&data, &properties);
 
-        assert!(read.is_empty(), "must consume the payload exactly, {} bytes left", read.len());
+        assert!(decoded.is_complete(), "must consume the payload exactly: {:?}", decoded.stopped);
+        let values = decoded.values;
 
         let named: Vec<(u8, &str)> = values.iter().map(|(id, name, _)| (*id, &**name)).collect();
         assert_eq!(named, [
@@ -2767,7 +2852,59 @@ mod tests {
         // `addChangedProperties` returns before writing the count when it finds nothing to
         // send, and `BWEntity::onProperties` matches that with an up-front
         // `if (!data.remainingLength()) return;`.
-        assert!(read_changed_properties(&mut &[][..], &properties, 0).unwrap().is_empty());
+        let empty = read_changed_properties(&[], &properties);
+        assert!(empty.values.is_empty() && empty.is_complete());
+
+    }
+
+    /// An exposed id the table doesn't cover must keep the properties decoded *before* it.
+    ///
+    /// This is the live `Vehicle` case: its table is short by the dynamic components, so
+    /// a create carries ids past the end. Discarding the whole run there left vehicles
+    /// with no tracked values at all, and so no `Array` lengths for compressed paths.
+    #[test]
+    fn changed_properties_keep_the_prefix_past_an_unknown_id() {
+
+        let mut sys = TySystem::default();
+        let i32_ty = sys.find("INT32").unwrap();
+        let properties = vec![
+            PropertyDef { name: Arc::from("vehicleID"), ty: i32_ty, length: ElementLength::Fixed(4) },
+        ];
+
+        // Three properties promised; the second id (0x62 = 98, as seen live) is past the
+        // end of a one-entry table, so everything from there on is unreadable.
+        let data = const_hex("0300e729890062deadbeef");
+        let decoded = read_changed_properties(&data, &properties);
+
+        assert_eq!(decoded.values.len(), 1, "the readable prefix survives");
+        assert_eq!(decoded.values[0].1.as_ref(), "vehicleID");
+        assert_eq!(decoded.values[0].2, Value::Int32(8989159));
+
+        let stop = decoded.stopped.expect("must report why it stopped");
+        assert_eq!(stop.expected, 3);
+        assert!(stop.reason.contains("exposed id 98"), "{}", stop.reason);
+        // Cut from the start of the offending property, not mid-value.
+        assert_eq!(stop.rest, const_hex("62deadbeef"));
+
+    }
+
+    /// Every id resolved, yet bytes are left: the table drifted from the server's.
+    #[test]
+    fn changed_properties_report_trailing_bytes() {
+
+        let mut sys = TySystem::default();
+        let i32_ty = sys.find("INT32").unwrap();
+        let properties = vec![
+            PropertyDef { name: Arc::from("vehicleID"), ty: i32_ty, length: ElementLength::Fixed(4) },
+        ];
+
+        let data = const_hex("0100e7298900ff");
+        let decoded = read_changed_properties(&data, &properties);
+
+        assert_eq!(decoded.values.len(), 1);
+        let stop = decoded.stopped.expect("trailing bytes must be reported");
+        assert!(stop.reason.contains("trailing"), "{}", stop.reason);
+        assert_eq!(stop.rest, const_hex("ff"));
 
     }
 

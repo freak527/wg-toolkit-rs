@@ -17,7 +17,7 @@ use wgtk::net::bundle::{Bundle, NextElementReader, ElementReader};
 use wgtk::net::codec::WgSocketAddrV4;
 
 use wgtk::app::{proxy, login_proxy, base, client};
-use wgtk::app::dispatch::{ScriptDispatch, MethodCall, MethodDef};
+use wgtk::app::dispatch::{ScriptDispatch, MethodCall, MethodDef, PropertyDef};
 use wgtk::app::math::{PackedXyz, PackedXz, calculate_reference_position};
 use glam::Vec3;
 use wgtk::app::base::element::CellMethodTables;
@@ -711,27 +711,41 @@ impl BaseHandler {
     /// length to resolve against from the very first update rather than only after the
     /// server happens to resend the whole property.
     ///
-    /// Decode failures are logged, not propagated: the values are a bonus on top of the
-    /// create itself, and the element has already been framed by the time we get here.
-    fn seed_entity_properties(&mut self, addr: SocketAddr, entity_id: u32, type_id: u16, client_data: &[u8]) {
+    /// `decode` is the create element's own `client_properties`, passed as a closure only
+    /// because the property table it needs is looked up here, from the type id.
+    ///
+    /// A run that stops early is logged, not dropped: whatever decoded before the stop is
+    /// still the server's own state, and for a `Vehicle` -- whose table is short by its
+    /// dynamic components -- the prefix is the only seeding there is.
+    fn seed_entity_properties(
+        &mut self,
+        addr: SocketAddr,
+        entity_id: u32,
+        type_id: u16,
+        decode: impl FnOnce(&[PropertyDef]) -> client::element::ChangedProperties,
+    ) {
 
         let Some(dispatch) = self.shared.dispatch.entity_from_id(type_id) else { return };
+        let decoded = decode(&dispatch.properties);
 
-        match client::element::read_changed_properties(&mut &client_data[..], &dispatch.properties, client_data.len()) {
-            Ok(values) => {
-                if values.is_empty() {
-                    return;
-                }
-                let names: Vec<&str> = values.iter().map(|(_, name, _)| &**name).collect();
-                trace!(%addr, "entity {entity_id} initial properties: {names:?}");
-                let tracked = self.entity_properties.entry(entity_id).or_default();
-                for (_, name, value) in values {
-                    tracked.insert(name, value);
-                }
-            }
-            // Worth a warning rather than silence: this is the same exposed-id table the
-            // rest of dispatch relies on, so a mismatch here is evidence about that table.
-            Err(e) => warn!(%addr, "entity {entity_id} (type 0x{type_id:02X}) initial properties failed to decode: {e}"),
+        // Worth a warning rather than silence: this is the same exposed-id table the rest
+        // of dispatch relies on, so a mismatch here is evidence about that table.
+        if let Some(stop) = &decoded.stopped {
+            warn!(%addr, rest = %hex(&stop.rest),
+                "entity {entity_id} (type 0x{type_id:02X}) initial properties stopped early: \
+                 kept {} of {}, {}", decoded.values.len(), stop.expected, stop.reason);
+        }
+
+        if decoded.values.is_empty() {
+            return;
+        }
+
+        let names: Vec<&str> = decoded.values.iter().map(|(_, name, _)| &**name).collect();
+        trace!(%addr, "entity {entity_id} initial properties: {names:?}");
+
+        let tracked = self.entity_properties.entry(entity_id).or_default();
+        for (_, name, value) in decoded.values {
+            tracked.insert(name, value);
         }
 
     }
@@ -1432,7 +1446,8 @@ impl BaseHandler {
                     }
                 };
                 self.created_entity_types.insert(e.element.entity_id, e.element.entity_type_id);
-                self.seed_entity_properties(addr, e.element.entity_id, e.element.entity_type_id, &e.element.client_data);
+                self.seed_entity_properties(addr, e.element.entity_id, e.element.entity_type_id,
+                    |properties| e.element.client_properties(properties));
                 // `ServerConnection::createEntity` ends in `detailedPositionReceived`, so a
                 // create for the player's own entity re-bases the reference.
                 self.position.detailed_position_received(e.element.entity_id, self.player_entity_id, e.element.position);
@@ -1442,7 +1457,8 @@ impl BaseHandler {
             CreateEntityDetailed::ID => {
                 let e = elt.read_simple::<CreateEntityDetailed>()?;
                 self.created_entity_types.insert(e.element.entity_id, e.element.entity_type_id);
-                self.seed_entity_properties(addr, e.element.entity_id, e.element.entity_type_id, &e.element.client_data);
+                self.seed_entity_properties(addr, e.element.entity_id, e.element.entity_type_id,
+                    |properties| e.element.client_properties(properties));
                 self.position.detailed_position_received(e.element.entity_id, self.player_entity_id, e.element.position);
                 trace!(%addr, id = CreateEntityDetailed::ID, request_id = ?e.request_id, "{}: {:?}", stringify!(CreateEntityDetailed), e.element);
                 return Ok(true);
@@ -1734,23 +1750,26 @@ impl BaseHandler {
                     return Ok(true);
                 };
 
-                match elt.read::<UpdateEntity, _>(&dispatch.properties)?.element {
-                    UpdateEntity::Known(values) => {
-                        info!(%addr, id, "<- Update entity: ({entity_id}) {}",
-                            values.iter().map(|(_, name, value)| format!("{name}={value:?}"))
-                                .collect::<Vec<_>>().join(", "));
-                        // These are whole property values, so they are as authoritative as
-                        // `ENTITY_PROPERTY`'s -- and they are the only source for
-                        // properties held back from the creation payload by level of
-                        // detail, which is what otherwise leaves an `Array` length unknown.
-                        let tracked = self.entity_properties.entry(entity_id).or_default();
-                        for (_, name, value) in values {
-                            tracked.insert(name, value);
-                        }
+                let UpdateEntity(decoded) = elt.read::<UpdateEntity, _>(&dispatch.properties)?.element;
+
+                if let Some(stop) = &decoded.stopped {
+                    warn!(%addr, id, rest = %hex(&stop.rest),
+                        "<- Update entity (stopped early): ({entity_id}) kept {} of {}, {}",
+                        decoded.values.len(), stop.expected, stop.reason);
+                }
+
+                if !decoded.values.is_empty() {
+                    info!(%addr, id, "<- Update entity: ({entity_id}) {}",
+                        decoded.values.iter().map(|(_, name, value)| format!("{name}={value:?}"))
+                            .collect::<Vec<_>>().join(", "));
+                    // These are whole property values, so they are as authoritative as
+                    // `ENTITY_PROPERTY`'s -- and they are the only source for properties
+                    // held back from the creation payload by level of detail, which is
+                    // what otherwise leaves an `Array` length unknown.
+                    let tracked = self.entity_properties.entry(entity_id).or_default();
+                    for (_, name, value) in decoded.values {
+                        tracked.insert(name, value);
                     }
-                    UpdateEntity::Unknown { data, reason } =>
-                        warn!(%addr, id, len = data.len(), data = %hex(&data),
-                            "<- Update entity (failed to decode): ({entity_id}) {reason}"),
                 }
 
                 return Ok(true);
