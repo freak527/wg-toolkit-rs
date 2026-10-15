@@ -1363,7 +1363,7 @@ impl NrlStream {
 
     /// Decode a stream. `implied` is the message type of the leading message when the
     /// element id already fixes it (its type byte is then absent from the wire).
-    fn read_with(read: &mut dyn Read, implied: Option<u8>) -> io::Result<Self> {
+    pub(crate) fn read_with(read: &mut dyn Read, implied: Option<u8>) -> io::Result<Self> {
         let mut buf = Vec::new();
         read.read_to_end(&mut buf)?;
 
@@ -1417,7 +1417,7 @@ impl NrlStream {
         Ok(Self { messages, rest: buf[pos..].to_vec() })
     }
 
-    fn write_with(&self, write: &mut dyn Write, implied: bool) -> io::Result<()> {
+    pub(crate) fn write_with(&self, write: &mut dyn Write, implied: bool) -> io::Result<()> {
         for (index, message) in self.messages.iter().enumerate() {
             let msg_type = match &message.body {
                 NrlBody::CreateNode { .. } => 0,
@@ -1672,12 +1672,39 @@ impl SimpleElement for NrlUpdateNode {
     const LEN: ElementLength = ElementLength::Variable16;
 }
 
-/// Drains one message-type-2 (unlink) record from the [`NrlData`] reassembly buffer;
-/// it has no payload of its own.
-pub type NrlUnlinkTreeFlag = DebugElementFixed<{ id::NRL_UNLINK_TREE_FLAG }, 0>;
-/// Drains one message-type-6 (update) record from the [`NrlData`] reassembly buffer;
-/// it has no payload of its own.
-pub type NrlUpdateNodeFlag = DebugElementFixed<{ id::NRL_UPDATE_NODE_FLAG }, 0>;
+/// Drains one message-type-2 (unlink) record from the [`NrlData`] reassembly buffer.
+///
+/// Carries no bytes at all, so there is nothing left to decode: the element's *presence*
+/// in the bundle is the whole message. Spelled out as its own zero-length type rather
+/// than a `DebugElement*` so it stops reading as an undecoded gap -- what it still lacks
+/// is the [`NrlData`] reassembly state it refers to, not a codec.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NrlUnlinkTreeFlag;
+
+impl SimpleCodec for NrlUnlinkTreeFlag {
+    fn write(&self, _write: &mut dyn Write) -> io::Result<()> { Ok(()) }
+    fn read(_read: &mut dyn Read) -> io::Result<Self> { Ok(Self) }
+}
+
+impl SimpleElement for NrlUnlinkTreeFlag {
+    const ID: u8 = id::NRL_UNLINK_TREE_FLAG;
+    const LEN: ElementLength = ElementLength::ZERO;
+}
+
+/// Drains one message-type-6 (update) record from the [`NrlData`] reassembly buffer.
+/// Payload-less, exactly as [`NrlUnlinkTreeFlag`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NrlUpdateNodeFlag;
+
+impl SimpleCodec for NrlUpdateNodeFlag {
+    fn write(&self, _write: &mut dyn Write) -> io::Result<()> { Ok(()) }
+    fn read(_read: &mut dyn Read) -> io::Result<Self> { Ok(Self) }
+}
+
+impl SimpleElement for NrlUpdateNodeFlag {
+    const ID: u8 = id::NRL_UPDATE_NODE_FLAG;
+    const LEN: ElementLength = ElementLength::ZERO;
+}
 
 /// The decoded body of an [`NrlUnreliableMsgToClient`], keyed off its `kind` byte.
 #[derive(Debug, Clone)]

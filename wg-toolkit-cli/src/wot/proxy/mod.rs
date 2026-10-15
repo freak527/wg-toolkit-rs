@@ -242,6 +242,9 @@ pub fn run(
         session_keys: HashMap::new(),
         position: PositionTracker::new(),
         entity_properties: HashMap::new(),
+        census_in: HashMap::new(),
+        census_out: HashMap::new(),
+        census_pending: 0,
     };
 
     thread::scope(move |scope| {
@@ -536,6 +539,16 @@ struct BaseHandler {
     /// themselves. A property never seen whole simply stays absent, and the decoder falls
     /// back to guessing for it.
     entity_properties: HashMap<u32, HashMap<Arc<str>, Value>>,
+    /// How many times each element id was seen, inbound and outbound, and how many have
+    /// been counted since the last report.
+    ///
+    /// This is coverage instrumentation, not protocol state. The list of ids still
+    /// decoded by a `DebugElement*` placeholder is only a work list next to how much
+    /// traffic each one actually carries, and `trace_dbg!` logs at TRACE, so an
+    /// INFO-level session otherwise says nothing about them. See [`Self::count_element`].
+    census_in: HashMap<u8, u32>,
+    census_out: HashMap<u8, u32>,
+    census_pending: u32,
 }
 
 #[derive(Debug)]
@@ -706,6 +719,35 @@ impl proxy::Handler for BaseHandler {
 
 impl BaseHandler {
 
+    /// Tally one element id, and periodically log the running census.
+    ///
+    /// Reported periodically rather than at exit because the proxy has no shutdown hook,
+    /// so the last report before you stop it is the session's census. The interval is
+    /// coarse on purpose: a battle pushes ~600 elements/second, so anything finer buries
+    /// the decode warnings this log exists for.
+    fn count_element(&mut self, outbound: bool, id: u8) {
+
+        {
+            let census = if outbound { &mut self.census_out } else { &mut self.census_in };
+            *census.entry(id).or_insert(0) += 1;
+        }
+
+        self.census_pending += 1;
+        if self.census_pending >= 50_000 {
+            self.census_pending = 0;
+            let fmt = |census: &HashMap<u8, u32>| {
+                let mut counts: Vec<(u32, u8)> =
+                    census.iter().map(|(&id, &n)| (n, id)).collect();
+                counts.sort_unstable_by(|a, b| b.cmp(a));
+                counts.iter().map(|(n, id)| format!("0x{id:02X}:{n}"))
+                    .collect::<Vec<_>>().join(" ")
+            };
+            info!("element census <- {}", fmt(&self.census_in));
+            info!("element census -> {}", fmt(&self.census_out));
+        }
+
+    }
+
     /// Seed [`Self::entity_properties`] from an entity-creation payload's initial property
     /// values, so a compressed path crossing one of this entity's `Array`s has a real
     /// length to resolve against from the very first update rather than only after the
@@ -868,6 +910,7 @@ impl BaseHandler {
         while let Some(elt) = reader.next() {
             match elt {
                 NextElementReader::Element(elt) => {
+                    self.count_element(true, elt.id());
                     if !self.read_out_element(&mut peer, elt)? {
                         break;
                     }
@@ -946,7 +989,20 @@ impl BaseHandler {
             }
             AckPhysicsCorrection::ID => return trace_dbg!(elt, addr, AckPhysicsCorrection),
             RequestEntityUpdate::ID => return trace_dbg!(elt, addr, RequestEntityUpdate),
-            NrlMsgToCell::ID => return trace_dbg!(elt, addr, NrlMsgToCell),
+            NrlMsgToCell::ID => {
+                // At INFO, unlike the other `Nrl*` elements, because this direction's
+                // framing is inferred from the inbound stream rather than confirmed
+                // against a capture (the proxy dumps inbound packets only). `rest` is the
+                // verdict: empty across a session means the client -> cell direction
+                // really is the same `BWEndPoint` stream. Drop this back to `trace_dbg!`
+                // once that holds.
+                let e = elt.read_simple::<NrlMsgToCell>()?;
+                let NrlMsgToCell(stream) = &e.element;
+                info!(%addr, id = NrlMsgToCell::ID, messages = stream.messages.len(),
+                    rest = stream.rest.len(),
+                    "-> Nrl msg to cell: {:?}", stream.messages);
+                return Ok(true);
+            }
             AvatarUpdateWardImplicit::ID => return trace_dbg!(elt, addr, AvatarUpdateWardImplicit),
             AvatarUpdateWardExplicit::ID => return trace_dbg!(elt, addr, AvatarUpdateWardExplicit),
             AckWardPhysicsCorrection::ID => return trace_dbg!(elt, addr, AckWardPhysicsCorrection),
@@ -1029,6 +1085,7 @@ impl BaseHandler {
         while let Some(elt) = reader.next() {
             match elt {
                 NextElementReader::Element(elt) => {
+                    self.count_element(false, elt.id());
                     if !self.read_in_element(&mut peer, elt)? {
                         break;
                     }

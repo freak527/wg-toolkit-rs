@@ -11,6 +11,8 @@ use crate::net::element::{DebugElementFixed, DebugElementVariable16, ElementLeng
 use crate::util::io::WgReadExt;
 use crate::app::dispatch::{MethodDef, MethodCall};
 use crate::app::math::PackedYawPitchRoll;
+use crate::app::client::element::NrlStream;
+use crate::net::codec::SimpleCodec;
 
 
 /// Internal module containing all raw elements numerical ids.
@@ -240,7 +242,35 @@ pub type RequestEntityUpdate = DebugElementVariable16<{ id::REQUEST_ENTITY_UPDAT
 // `Nrl*` section banner for what this is.
 // =============================================================================
 
-pub type NrlMsgToCell = DebugElementVariable16<{ id::NRL_MSG_TO_CELL }>;
+/// The client -> cell direction of the NRL message stream: the mirror of
+/// [`crate::app::client::element::NrlMsgToClient`], and framed identically.
+///
+/// Same `[msg_type: u8][node_id: u16 big-endian][body]` records, with no implied leading
+/// type, because both directions are the same `BWEndPoint` stream -- only the transport
+/// element differs. What travels this way is the `ServerMethodCallerNode` side of the
+/// tree (the client invoking a dynamic component's server method) plus node lookups.
+///
+/// The framing is inferred from the inbound direction rather than confirmed against a
+/// capture, because the proxy only dumps inbound packets. [`NrlStream::rest`] is the
+/// check: it is empty when every record framed, and holds the bytes from the first
+/// record that didn't otherwise -- a consistently non-empty `rest` would mean this
+/// direction is *not* the same stream after all.
+#[derive(Debug, Clone)]
+pub struct NrlMsgToCell(pub NrlStream);
+
+impl SimpleCodec for NrlMsgToCell {
+    fn write(&self, write: &mut dyn Write) -> io::Result<()> {
+        self.0.write_with(write, false)
+    }
+    fn read(read: &mut dyn Read) -> io::Result<Self> {
+        NrlStream::read_with(read, None).map(Self)
+    }
+}
+
+impl SimpleElement for NrlMsgToCell {
+    const ID: u8 = id::NRL_MSG_TO_CELL;
+    const LEN: ElementLength = ElementLength::Variable16;
+}
 
 // =============================================================================
 // Ward avatar updates & session control
@@ -424,6 +454,34 @@ impl<'t> Element<dyn CellMethodTables + 't> for CellEntityMethod {
         };
 
         Ok(Self { entity_id, call })
+
+    }
+
+}
+
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use crate::app::client::element::NrlBody;
+
+    /// [`NrlMsgToCell`] frames the generic `[type][node id][body]` stream, with no
+    /// implied leading type -- the one assumption this direction rests on.
+    #[test]
+    fn nrl_msg_to_cell_frames_the_generic_stream() {
+
+        // type 5 (lookup) on node 0x002a, then type 2 (unlink) on node 0x002b. Neither
+        // is terminal, so both must frame and nothing may be left over.
+        let data = [0x05, 0x00, 0x2a, 0x02, 0x00, 0x2b];
+        let NrlMsgToCell(stream) = <NrlMsgToCell as SimpleCodec>::read(&mut &data[..]).unwrap();
+
+        assert_eq!(stream.messages.len(), 2);
+        assert_eq!(stream.messages[0].node_id, 0x2a);
+        assert!(matches!(stream.messages[0].body, NrlBody::Lookup));
+        assert_eq!(stream.messages[1].node_id, 0x2b);
+        assert!(matches!(stream.messages[1].body, NrlBody::UnlinkTree));
+        assert!(stream.rest.is_empty(), "rest: {:?}", stream.rest);
 
     }
 
