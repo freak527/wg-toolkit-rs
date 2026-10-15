@@ -12,7 +12,7 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 use flate2::read::ZlibDecoder;
 use blowfish::Blowfish;
 
-use wgtk::net::element::{DebugElementUndefined, DebugElementVariable16, DebugElementVariable32, Element, SimpleElement, REPLY_ID};
+use wgtk::net::element::{DebugElementUndefined, DebugElementVariable16, DebugElementVariable32, SimpleElement, REPLY_ID};
 use wgtk::net::bundle::{Bundle, NextElementReader, ElementReader};
 use wgtk::net::codec::WgSocketAddrV4;
 
@@ -46,6 +46,38 @@ fn fmt_id_alias(id_alias: u8) -> String {
     } else {
         id_alias.to_string()
     }
+}
+
+/// Follow a decoded compressed path to the container it addresses, for applying an
+/// update to [`BaseHandler::entity_properties`].
+///
+/// The path's first step is always the top-level property name; the rest descend through
+/// dicts (`Field`) and sequences (`Index`). Returns `None` when the path doesn't fit the
+/// value we hold -- a stale or never-seeded property -- rather than inventing structure,
+/// since a wrong array length is worse than a missing one (see the caller).
+fn resolve_path<'v>(
+    properties: &'v mut HashMap<Arc<str>, Value>,
+    path: &[client::element::EntityPropertyPathStep],
+) -> Option<&'v mut Value> {
+
+    use client::element::EntityPropertyPathStep as Step;
+
+    let (Step::Field(name), rest) = path.split_first()? else {
+        return None;  // A top-level property is always addressed by name.
+    };
+
+    let mut value = properties.get_mut(name)?;
+
+    for step in rest {
+        value = match (step, value) {
+            (Step::Field(name), Value::Dict(dict)) => dict.get_mut(name)?,
+            (Step::Index(index), Value::Seq(items)) => items.get_mut(*index as usize)?,
+            _ => return None,
+        };
+    }
+
+    Some(value)
+
 }
 
 /// Hex-encode bytes for embedding in a log line (used for raw payloads that failed to
@@ -209,6 +241,7 @@ pub fn run(
         partial_resources: HashMap::new(),
         session_keys: HashMap::new(),
         position: PositionTracker::new(),
+        entity_properties: HashMap::new(),
     };
 
     thread::scope(move |scope| {
@@ -487,6 +520,22 @@ struct BaseHandler {
     session_keys: HashMap<SocketAddr, u32>,
     /// Relative-position state: see [`PositionTracker`].
     position: PositionTracker,
+    /// The current value of every client-visible property this proxy has seen set, per
+    /// entity.
+    ///
+    /// Kept because a compressed property path is only decodable against the *live* length
+    /// of every `Array` it crosses: the length decides how many bits the index and range
+    /// fields occupy, so without it `decode_compressed_path` has to try every length and
+    /// keep whichever parses are self-consistent -- ambiguous whenever two lengths agree
+    /// on the bits. Before this was tracked, a battle's 46 slice updates split 28 exact /
+    /// 9 resolved only by a since-removed append guess / 9 ambiguous outright; with it,
+    /// and with creation-time seeding plus `updateEntity`, every slice decoded exactly.
+    ///
+    /// Seeded by whole-property updates (`ENTITY_PROPERTY`, e.g. `damageStickers=[]`
+    /// before a destructible is first hit) and then maintained by the nested/slice updates
+    /// themselves. A property never seen whole simply stays absent, and the decoder falls
+    /// back to guessing for it.
+    entity_properties: HashMap<u32, HashMap<Arc<str>, Value>>,
 }
 
 #[derive(Debug)]
@@ -657,7 +706,88 @@ impl proxy::Handler for BaseHandler {
 
 impl BaseHandler {
 
-/// Why `selected_entity_id` failed to resolve a dispatch table, for the "no dispatch
+    /// Seed [`Self::entity_properties`] from an entity-creation payload's initial property
+    /// values, so a compressed path crossing one of this entity's `Array`s has a real
+    /// length to resolve against from the very first update rather than only after the
+    /// server happens to resend the whole property.
+    ///
+    /// Decode failures are logged, not propagated: the values are a bonus on top of the
+    /// create itself, and the element has already been framed by the time we get here.
+    fn seed_entity_properties(&mut self, addr: SocketAddr, entity_id: u32, type_id: u16, client_data: &[u8]) {
+
+        let Some(dispatch) = self.shared.dispatch.entity_from_id(type_id) else { return };
+
+        match client::element::read_changed_properties(&mut &client_data[..], &dispatch.properties, client_data.len()) {
+            Ok(values) => {
+                if values.is_empty() {
+                    return;
+                }
+                let names: Vec<&str> = values.iter().map(|(_, name, _)| &**name).collect();
+                trace!(%addr, "entity {entity_id} initial properties: {names:?}");
+                let tracked = self.entity_properties.entry(entity_id).or_default();
+                for (_, name, value) in values {
+                    tracked.insert(name, value);
+                }
+            }
+            // Worth a warning rather than silence: this is the same exposed-id table the
+            // rest of dispatch relies on, so a mismatch here is evidence about that table.
+            Err(e) => warn!(%addr, "entity {entity_id} (type 0x{type_id:02X}) initial properties failed to decode: {e}"),
+        }
+
+    }
+
+    /// Apply a decoded slice update to the tracked value of the entity's property, so the
+    /// `Array` it targets keeps its true length for later compressed-path decodes.
+    ///
+    /// A no-op when the property was never seen whole: the decoder guesses lengths for it
+    /// either way, and inventing a baseline here would turn a guess into recorded fact.
+    fn apply_slice(
+        &mut self,
+        entity_id: u32,
+        path: &[client::element::EntityPropertyPathStep],
+        start: u32,
+        end: u32,
+        values: &[Value],
+    ) {
+
+        let Some(properties) = self.entity_properties.get_mut(&entity_id) else { return };
+        let Some(Value::Seq(items)) = resolve_path(properties, path) else { return };
+
+        let (start, end) = (start as usize, end as usize);
+        if start > end || end > items.len() {
+            // The decode disagrees with the length we hold, so one of them is wrong. Drop the
+            // tracked value rather than splice at a bogus offset -- guessing again is
+            // recoverable, a silently corrupted array is not.
+            warn!("entity {entity_id} {path:?}: slice [{start}..{end}] outside tracked length {}, dropping tracked value",
+                items.len());
+            if let Some(client::element::EntityPropertyPathStep::Field(name)) = path.first() {
+                let name = Arc::clone(name);
+                properties.remove(&name);
+            }
+            return;
+        }
+
+        items.splice(start..end, values.iter().cloned());
+
+    }
+
+    /// Apply a decoded nested (single-field) update to the tracked value, same contract as
+    /// [`Self::apply_slice`].
+    fn apply_nested(
+        &mut self,
+        entity_id: u32,
+        path: &[client::element::EntityPropertyPathStep],
+        value: &Value,
+    ) {
+
+        let Some(properties) = self.entity_properties.get_mut(&entity_id) else { return };
+        let Some(slot) = resolve_path(properties, path) else { return };
+
+        *slot = value.clone();
+
+    }
+
+    /// Why `selected_entity_id` failed to resolve a dispatch table, for the "no dispatch
     /// table" warnings: distinguishes "nothing is selected" (an AVUPMSG whose id alias we
     /// never saw an `EnterAoi` for clears the selection) from "selected, but we were never
     /// told this entity's type" (no `CreateEntity`/`CreateBasePlayer` for it).
@@ -952,6 +1082,12 @@ impl BaseHandler {
                 // a wrong type for a reused id. Dropped wholesale: unlike `entities`, this
                 // never holds the player, so nothing here needs preserving.
                 self.created_entity_types.clear();
+                // Same reasoning as `created_entity_types`: entity ids are reused across
+                // spaces, and a stale `Array` length carried into a new space would be
+                // *worse* than none, since the decoder trusts a tracked length outright
+                // where it merely guesses without one. The player is not preserved here
+                // either: its properties are re-sent on entering the new space.
+                self.entity_properties.clear();
                 // The alias table is per-connection state in the real client and is wiped
                 // by the same reset that clears `id_`/`spaceID_`/`controlledEntities_`
                 // (`memset( idAlias_, 0, sizeof( idAlias_ ) )`). Aliases are small ints
@@ -1296,6 +1432,7 @@ impl BaseHandler {
                     }
                 };
                 self.created_entity_types.insert(e.element.entity_id, e.element.entity_type_id);
+                self.seed_entity_properties(addr, e.element.entity_id, e.element.entity_type_id, &e.element.client_data);
                 // `ServerConnection::createEntity` ends in `detailedPositionReceived`, so a
                 // create for the player's own entity re-bases the reference.
                 self.position.detailed_position_received(e.element.entity_id, self.player_entity_id, e.element.position);
@@ -1305,6 +1442,7 @@ impl BaseHandler {
             CreateEntityDetailed::ID => {
                 let e = elt.read_simple::<CreateEntityDetailed>()?;
                 self.created_entity_types.insert(e.element.entity_id, e.element.entity_type_id);
+                self.seed_entity_properties(addr, e.element.entity_id, e.element.entity_type_id, &e.element.client_data);
                 self.position.detailed_position_received(e.element.entity_id, self.player_entity_id, e.element.position);
                 trace!(%addr, id = CreateEntityDetailed::ID, request_id = ?e.request_id, "{}: {:?}", stringify!(CreateEntityDetailed), e.element);
                 return Ok(true);
@@ -1505,21 +1643,8 @@ impl BaseHandler {
             }
             id @ NestedEntityProperty::ID => {
 
-                // Buffer the raw payload first so a decode failure (or a missing dispatch
-                // table) can still report the exact bytes as plain hex, which is what makes
-                // such a failure diagnosable at all. Reading the correctly-framed element
-                // rather than an unbounded `DebugElementUndefined` also lets every path
-                // below continue the bundle safely.
-                let raw = elt.read_simple::<DebugElementVariable16<{ NestedEntityProperty::ID }>>()?;
-                let data = raw.element.data;
-
-                // Same dispatch-table requirement as `ENTITY_PROPERTY` below: decoding
-                // the compressed path needs the correct entity's own property table to
-                // know each container's shape (see `NestedEntityProperty`'s doc comment).
-                // Safe to consult `created_entity_types` here (unlike
-                // `ENTITY_PROPERTY`/`ENTITY_METHOD`): this element is always `Variable16`,
-                // so its framing doesn't depend on the table and a wrong guess can only
-                // produce a bad decode of this one element, never a bundle desync.
+                // Same dispatch-table requirement, and same safety argument, as the
+                // `SliceEntityProperty` arm below.
                 let dispatch = self.selected_entity_id.and_then(|entity_id| {
                     let type_id = self.created_entity_types.get(&entity_id).copied()
                         .or_else(|| self.entities.get(&entity_id).map(|&(type_id, _)| type_id))?;
@@ -1527,20 +1652,23 @@ impl BaseHandler {
                 });
 
                 let Some((entity_id, dispatch)) = dispatch else {
-                    warn!(%addr, id, len = data.len(), data = %hex(&data),
+                    let raw = elt.read_simple::<DebugElementVariable16<{ NestedEntityProperty::ID }>>()?;
+                    warn!(%addr, id, len = raw.element.data.len(), data = %hex(&raw.element.data),
                         "<- Nested entity property (no dispatch table)");
                     return Ok(true);
                 };
 
-                let mut read = io::Cursor::new(&data[..]);
-                match NestedEntityProperty::read(&mut read, &dispatch.properties, data.len(), id) {
-                    Ok(p) => info!(%addr, id, len = data.len(), data = %hex(&data),
-                        "<- Nested entity property: ({entity_id}) {:?} = {:?}", p.path, p.value),
-                    // Unlike `ENTITY_PROPERTY`, a decode failure here doesn't risk
-                    // desyncing the rest of the bundle (the payload is fully consumed
-                    // above), so log and keep going rather than stop the whole bundle.
-                    Err(e) => warn!(%addr, id, len = data.len(), data = %hex(&data),
-                        "<- Nested entity property (failed to decode): ({entity_id}) {e}"),
+                let config = client::element::PropertyPathConfig::with_values(
+                    &dispatch.properties, self.entity_properties.get(&entity_id));
+
+                match elt.read::<NestedEntityProperty, _>(&config)?.element {
+                    NestedEntityProperty::Known { path, value } => {
+                        info!(%addr, id, "<- Nested entity property: ({entity_id}) {path:?} = {value:?}");
+                        self.apply_nested(entity_id, &path, &value);
+                    }
+                    NestedEntityProperty::Unknown { data, reason } =>
+                        warn!(%addr, id, len = data.len(), data = %hex(&data),
+                            "<- Nested entity property (failed to decode): ({entity_id}) {reason}"),
                 }
 
                 return Ok(true);
@@ -1548,12 +1676,8 @@ impl BaseHandler {
             }
             id @ SliceEntityProperty::ID => {
 
-                // See the `NestedEntityProperty` arm above for why the payload is
-                // buffered and hex-logged before any decode is attempted.
-                let raw = elt.read_simple::<DebugElementVariable16<{ SliceEntityProperty::ID }>>()?;
-                let data = raw.element.data;
-
-                // Safe to consult `created_entity_types` here (unlike
+                // Resolving the compressed path needs the selected entity's own property
+                // table. Safe to consult `created_entity_types` here (unlike
                 // `ENTITY_PROPERTY`/`ENTITY_METHOD`): this element is always `Variable16`,
                 // so its framing doesn't depend on the table and a wrong guess can only
                 // produce a bad decode of this one element, never a bundle desync.
@@ -1563,30 +1687,75 @@ impl BaseHandler {
                     Some((entity_id, self.shared.dispatch.entity_from_id(type_id)?))
                 });
 
+                // With no table there is nothing to decode against, but the element still
+                // has to be consumed for the bundle to continue -- so read it raw and hex
+                // it, which is also what makes such a case diagnosable at all.
                 let Some((entity_id, dispatch)) = dispatch else {
-                    warn!(%addr, id, len = data.len(), data = %hex(&data),
+                    let raw = elt.read_simple::<DebugElementVariable16<{ SliceEntityProperty::ID }>>()?;
+                    warn!(%addr, id, len = raw.element.data.len(), data = %hex(&raw.element.data),
                         "<- Slice entity property (no dispatch table)");
                     return Ok(true);
                 };
 
-                let mut read = io::Cursor::new(&data[..]);
-                match SliceEntityProperty::read(&mut read, &dispatch.properties, data.len(), id) {
-                    // Several readings parsed and the append-consistent one was picked;
-                    // keep that visibly distinct so a wrong pick can't become fact.
-                    Ok(p) if p.seq_len_inferred => info!(%addr, id, len = data.len(), data = %hex(&data),
-                        "<- Slice entity property (append-inferred): ({entity_id}) {:?} [{}..{}] = {:?}",
-                        p.path, p.start, p.end, p.values),
-                    Ok(p) => info!(%addr, id, len = data.len(), data = %hex(&data),
-                        "<- Slice entity property: ({entity_id}) {:?} [{}..{}] = {:?}",
-                        p.path, p.start, p.end, p.values),
-                    Err(e) => warn!(%addr, id, len = data.len(), data = %hex(&data),
-                        "<- Slice entity property (failed to decode): ({entity_id}) {e}"),
+                // Tracked `Array` lengths pin the decode where it would otherwise have to
+                // guess -- see `entity_properties`.
+                let config = client::element::PropertyPathConfig::with_values(
+                    &dispatch.properties, self.entity_properties.get(&entity_id));
+
+                match elt.read::<SliceEntityProperty, _>(&config)?.element {
+                    SliceEntityProperty::Known { path, start, end, values } => {
+                        info!(%addr, id, "<- Slice entity property: ({entity_id}) {path:?} [{start}..{end}] = {values:?}");
+                        self.apply_slice(entity_id, &path, start, end, &values);
+                    }
+                    SliceEntityProperty::Unknown { data, reason } =>
+                        warn!(%addr, id, len = data.len(), data = %hex(&data),
+                            "<- Slice entity property (failed to decode): ({entity_id}) {reason}"),
                 }
 
                 return Ok(true);
 
             }
-            UpdateEntity::ID => return trace_dbg!(elt, addr, UpdateEntity),
+            id @ UpdateEntity::ID => {
+
+                // Applies to the *selected* entity, like `ENTITY_PROPERTY`
+                // (`ServerConnection::updateEntity` -> `onEntityProperties(
+                // selectedEntityID_, ...)`). Safe to consult `created_entity_types`: this
+                // element is `Variable16`, so its framing never depends on the table.
+                let dispatch = self.selected_entity_id.and_then(|entity_id| {
+                    let type_id = self.created_entity_types.get(&entity_id).copied()
+                        .or_else(|| self.entities.get(&entity_id).map(|&(type_id, _)| type_id))?;
+                    Some((entity_id, self.shared.dispatch.entity_from_id(type_id)?))
+                });
+
+                let Some((entity_id, dispatch)) = dispatch else {
+                    let raw = elt.read_simple::<DebugElementVariable16<{ UpdateEntity::ID }>>()?;
+                    warn!(%addr, id, len = raw.element.data.len(), data = %hex(&raw.element.data),
+                        "<- Update entity (no dispatch table)");
+                    return Ok(true);
+                };
+
+                match elt.read::<UpdateEntity, _>(&dispatch.properties)?.element {
+                    UpdateEntity::Known(values) => {
+                        info!(%addr, id, "<- Update entity: ({entity_id}) {}",
+                            values.iter().map(|(_, name, value)| format!("{name}={value:?}"))
+                                .collect::<Vec<_>>().join(", "));
+                        // These are whole property values, so they are as authoritative as
+                        // `ENTITY_PROPERTY`'s -- and they are the only source for
+                        // properties held back from the creation payload by level of
+                        // detail, which is what otherwise leaves an `Array` length unknown.
+                        let tracked = self.entity_properties.entry(entity_id).or_default();
+                        for (_, name, value) in values {
+                            tracked.insert(name, value);
+                        }
+                    }
+                    UpdateEntity::Unknown { data, reason } =>
+                        warn!(%addr, id, len = data.len(), data = %hex(&data),
+                            "<- Update entity (failed to decode): ({entity_id}) {reason}"),
+                }
+
+                return Ok(true);
+
+            }
             SetCellAppExtAddress::ID => return trace_dbg!(elt, addr, SetCellAppExtAddress),
             LastProxyMessageAfterDirectCellAppConnection::ID => return trace_dbg!(elt, addr, LastProxyMessageAfterDirectCellAppConnection),
             id if id::ENTITY_METHOD.contains(id) => {
@@ -1692,6 +1861,11 @@ impl BaseHandler {
                     match elt.read::<EntityProperty, _>(&dispatch.properties) {
                         Ok(p) => {
                             info!(%addr, id, "<- Entity property: ({entity_id}) {}={:?}", p.element.name, p.element.value);
+                            // The only unambiguous source of a property's whole value, so
+                            // this is what seeds the live `Array` lengths that compressed
+                            // paths are decoded against.
+                            self.entity_properties.entry(entity_id).or_default()
+                                .insert(Arc::clone(&p.element.name), p.element.value);
                             return Ok(true);
                         }
                         Err(e) => {

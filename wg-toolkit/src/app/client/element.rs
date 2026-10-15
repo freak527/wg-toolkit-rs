@@ -3,6 +3,7 @@
 
 use std::io::{self, Read, Write};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::fmt;
 
@@ -517,11 +518,14 @@ pub struct CreateEntity {
     /// default `HALFPITCH = true`) -- decode with [`PackedYawPitchRoll::unpack`]
     /// passing `half_pitch = false`.
     pub direction: PackedYawPitchRoll,
-    /// Raw pre-encoded client-visible property dict bytes (only the entity's
-    /// `AllClients`-flagged properties, in exposed-id order). This project doesn't have
-    /// a dispatch table for that specific subset yet (unlike [`CreateBasePlayer`]'s own
-    /// `data_ty`, built for the different `AllClients | OwnClient | BaseAndClient` set
-    /// exposed to an entity's *own* client), so it's carried opaque for now.
+    /// The entity's initial client-visible property values, still encoded -- decode with
+    /// [`read_changed_properties`] against this entity type's own property table.
+    ///
+    /// Carried raw because this element's codec is reached without a dispatch table (the
+    /// entity's type id is only read *here*, from the same payload). Not a positional dict
+    /// of every `AllClients` property, as this comment used to claim: `addChangedProperties`
+    /// writes a count followed by `(exposed id, value)` pairs, covering only the properties
+    /// at the outer detail level whose event stamp is newer than the LoD's.
     pub client_data: Vec<u8>,
 }
 
@@ -1952,10 +1956,6 @@ pub enum EntityPropertyPathStep {
     Index(u32),
 }
 
-/// Upper bound on the `Array` length this project will guess while decoding a
-/// compressed property path -- see [`NestedEntityProperty`]'s doc comment.
-const MAX_SEQ_LEN_GUESS: u32 = 4096;
-
 /// `BitReader::bitsRequired` from the real engine (`cstdmf/bit_reader.cpp`): the number
 /// of bits needed to represent any value in `0..num_values`, `0` for `num_values <= 1`.
 fn bits_required(num_values: u32) -> u32 {
@@ -2021,34 +2021,35 @@ enum PathOutcome {
     Slice { path: Vec<EntityPropertyPathStep>, start: u32, end: u32, values: Vec<Value> },
 }
 
-/// One surviving interpretation from [`walk_path`], plus whether the `Array` length it
-/// assumed makes the slice a pure append. Kept beside the outcome so de-duplication
-/// compares only the semantic result.
-struct PathCandidate {
-    outcome: PathOutcome,
-    append_consistent: bool,
-}
-
 /// A direct port of the real engine's `PropertyChangeReader::readCompressedPathAndApply`
 /// (`entitydef/property_change_reader.cpp`): reads `[continue bit][index]` pairs,
 /// descending through `container`, until a `0` continue bit is read, then performs the
 /// leaf action (a single index for [`NestedEntityProperty`], an index range for
 /// [`SliceEntityProperty`]) directly against whichever container was reached.
 ///
-/// Crossing an `Array` (an unresolved element count, unlike a `Tuple`) branches over
-/// every length in `0..=MAX_SEQ_LEN_GUESS`, since this project doesn't track live
-/// per-entity-instance state the way the real engine does -- `out` collects every
-/// length guess that leads to a fully self-consistent decode (the whole message parsing
-/// cleanly to its last byte); `budget` bounds the total work across all branches taken
-/// together, and the search stops early past a handful of matches (already enough to
-/// call the decode ambiguous).
+/// Crossing an `Array` needs its *live* element count, which -- unlike a `Tuple`'s -- is
+/// not in the type, so it comes from `values`: the caller's tracked property values (see
+/// [`decode_compressed_path`]). Every container count is therefore known, every field
+/// width with it, and the descent follows exactly one branch -- `out` ends up with one
+/// outcome or none.
+///
+/// This used to brute-force the length instead, branching over `0..=4096` and keeping
+/// every guess that parsed cleanly to the last byte. That is gone: it could only ever
+/// return an answer it had no way to confirm, and tracked values make it unnecessary.
+/// An untracked array now ends the descent and the decode is reported as undecodable.
+///
+/// `live` is the tracked value of `container` itself, or `None` at the top level (where
+/// `values` is keyed by property name instead) and wherever tracking has no entry.
+/// `budget` bounds total work against malformed data.
 fn walk_path<'a>(
     container: PathContainer<'a>,
+    values: Option<&'a HashMap<Arc<str>, Value>>,
+    live: Option<&'a Value>,
     mut reader: BitReader<'a>,
     path: Vec<EntityPropertyPathStep>,
     is_slice: bool,
     budget: &mut u32,
-    out: &mut Vec<PathCandidate>,
+    out: &mut Vec<PathOutcome>,
 ) {
 
     if *budget == 0 || out.len() >= 16 {
@@ -2067,18 +2068,35 @@ fn walk_path<'a>(
         let Some(index) = reader.try_get(bits_required(count)) else { return };
         let Some((step, child_ty)) = container.child(index) else { return };
 
+        // The tracked value of the child we are about to descend into. At the top level
+        // the path step names a property, so it resolves against `values`; below that it
+        // indexes whatever `live` holds.
+        let live_child = match (&container, &step) {
+            (PathContainer::Top(_), EntityPropertyPathStep::Field(name)) =>
+                values.and_then(|values| values.get(name)),
+            (_, EntityPropertyPathStep::Field(name)) => match live {
+                Some(Value::Dict(dict)) => dict.get(name),
+                _ => None,
+            },
+            (_, EntityPropertyPathStep::Index(index)) => match live {
+                Some(Value::Seq(items)) => items.get(*index as usize),
+                _ => None,
+            },
+        };
+
         let mut child_path = path;
         child_path.push(step);
 
         match container_kind(child_ty) {
-            ContainerKind::Resolved(child) => walk_path(child, reader, child_path, is_slice, budget, out),
+            ContainerKind::Resolved(child) =>
+                walk_path(child, values, live_child, reader, child_path, is_slice, budget, out),
             ContainerKind::UnresolvedArray(elem_ty) => {
-                for len in 0..=MAX_SEQ_LEN_GUESS {
-                    if *budget == 0 || out.len() >= 16 {
-                        break;
-                    }
-                    walk_path(PathContainer::Seq(elem_ty, len), reader, child_path.clone(), is_slice, budget, out);
-                }
+                // An `Array`'s length is not in the type, so it has to come from the
+                // caller's tracked value. Without one the descent stops here and the
+                // decode fails, rather than branching over candidate lengths.
+                let Some(Value::Seq(items)) = live_child else { return };
+                walk_path(PathContainer::Seq(elem_ty, items.len() as u32), values, live_child,
+                    reader, child_path, is_slice, budget, out);
             }
             ContainerKind::NotAContainer => {}
         }
@@ -2111,14 +2129,7 @@ fn walk_path<'a>(
             values.push(value);
         }
 
-        // Every `count` in one `bits_required(count + 1)` bracket reads the same bits, so
-        // the guess is never pinned exactly; an append is satisfied by exactly one member
-        // of the bracket, which is how `decode_compressed_path` breaks ties.
-        let append_consistent = start == count && end == count;
-        out.push(PathCandidate {
-            outcome: PathOutcome::Slice { path, start, end, values },
-            append_consistent,
-        });
+        out.push(PathOutcome::Slice { path, start, end, values });
 
     } else {
 
@@ -2140,64 +2151,112 @@ fn walk_path<'a>(
 
         let mut leaf_path = path;
         leaf_path.push(step);
-        out.push(PathCandidate {
-            outcome: PathOutcome::Single { path: leaf_path, value },
-            append_consistent: false,
-        });
+        out.push(PathOutcome::Single { path: leaf_path, value });
 
     }
 
 }
 
-/// Decode a compressed path, returning the outcome and whether its `Array` length had to
-/// be inferred via the append rule (see below) rather than being unambiguous outright.
-fn decode_compressed_path(top: &[PropertyDef], data: &[u8], is_slice: bool) -> io::Result<(PathOutcome, bool)> {
+/// Decode a compressed path to the single interpretation consistent with the data, or
+/// fail. Nothing is guessed between candidates: several surviving readings means the
+/// `Array` length is undetermined and the caller is told so.
+fn decode_compressed_path(
+    top: &[PropertyDef],
+    values: Option<&HashMap<Arc<str>, Value>>,
+    data: &[u8],
+    is_slice: bool,
+) -> io::Result<PathOutcome> {
 
     let mut out = Vec::new();
     let mut budget = 200_000u32;
-    walk_path(PathContainer::Top(top), BitReader::new(data), Vec::new(), is_slice, &mut budget, &mut out);
+    walk_path(PathContainer::Top(top), values, None, BitReader::new(data), Vec::new(), is_slice, &mut budget, &mut out);
 
-    // Different `Array` length guesses that land in the same `bits_required` bracket
-    // read identical index/range bits and thus produce a byte-identical `PathOutcome`
-    // (the guessed length itself isn't part of the outcome) -- these aren't a real
-    // ambiguity, just the same answer reached via different guesses, so collapse them
-    // before deciding whether more than one *distinct* decode actually matched. The
-    // append flag is OR-ed across the collapsed group: at most one member of a bracket
-    // can satisfy `count == start == end`, and whether *any* did is what matters.
-    let mut unique: Vec<PathCandidate> = Vec::new();
-    for candidate in out {
-        match unique.iter_mut().find(|u| u.outcome == candidate.outcome) {
-            Some(existing) => existing.append_consistent |= candidate.append_consistent,
-            None => unique.push(candidate),
-        }
+    match out.len() {
+        1 => Ok(out.pop().unwrap()),
+        // Either the path crossed an `Array` this entity has no tracked value for, or the
+        // bytes genuinely don't fit the table. The two are worth telling apart by the
+        // caller's state, not here.
+        0 => Err(io::Error::new(io::ErrorKind::InvalidData,
+            "entity property path: no consistent decode (an Array whose live length isn't \
+             tracked for this entity, or a table that doesn't match these bytes)")),
+        // Every container count is known, so the descent cannot fork.
+        n => unreachable!("compressed path produced {n} outcomes from a single branch"),
     }
 
-    if unique.len() == 1 {
-        return Ok((unique.pop().unwrap().outcome, false));
+}
+
+/// Decode a run of client-visible property values written by the real engine's
+/// `EntityCache::addChangedProperties` (`cellapp/entity_cache.cpp`): a `uint8` count,
+/// then that many `(uint8 exposed id, value)` pairs. An empty payload is valid and
+/// decodes to no values -- see the `len == 0` case below.
+///
+/// The ids index `EntityDescription::clientServerProperty(i)` -- the very table
+/// [`crate::app::dispatch::EntityDispatch::properties`] reproduces -- so a decode here is
+/// also a check on that table. This is the body of both [`CreateEntity::client_data`]
+/// (the entity's initial values, via `addOuterDetailLevel`) and `updateEntity` (a later
+/// detail level's, or a refresh).
+///
+/// Confirmed byte-exact against a live capture: a `SPGZone` create carried
+/// `04 00 <vehicleID> 01 <equipmentID> 02 <launchTime> 03 <strikeTime>`, consuming the
+/// payload to its last byte, with `strikeTime` exactly 6.0s after `launchTime`.
+pub fn read_changed_properties(
+    read: &mut dyn Read,
+    properties: &[PropertyDef],
+    len: usize,
+) -> io::Result<Vec<(u8, Arc<str>, Value)>> {
+
+    // An empty payload is valid and means "nothing changed": `addChangedProperties`
+    // returns *before* writing the count when it finds nothing to send, and the client
+    // matches that with `if (!data.remainingLength()) return;` in `BWEntity::onProperties`.
+    // So the count byte is absent, not zero.
+    if len == 0 {
+        return Ok(Vec::new());
     }
 
-    if unique.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData,
-            "entity property path: no consistent decode found (possibly an Array whose live length isn't known)"));
+    let count = read.read_u8()?;
+    let mut out = Vec::with_capacity(count as usize);
+
+    for _ in 0..count {
+        let exposed_id = read.read_u8()?;
+        let Some(property) = properties.get(exposed_id as usize) else {
+            // Reading on would decode the rest against the wrong types, so stop with the
+            // ids recovered so far rather than inventing values.
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "changed properties: exposed id {exposed_id} past the end of a {}-entry \
+                 property table", properties.len())));
+        };
+        let value = Value::read(read, &property.ty)?;
+        out.push((exposed_id, Arc::clone(&property.name), value));
     }
 
-    // Tie-break: prefer the single reading where the assumed length equals `start`/`end`,
-    // i.e. the slice appends at the very end of the array. Exactly one member of a
-    // `bits_required` bracket can satisfy that, so it resolves the tie with no per-entity
-    // state -- which matters because a decode only ever pins the length to within a
-    // bracket, leaving delta-tracking no sound starting point.
-    //
-    // A genuine deletion (`[0..n] = []`) has the shape this rejects, so it would be
-    // mis-picked when an append-consistent reading also parses. Hence the returned flag:
-    // callers must surface an inferred decode distinctly from an unambiguous one.
-    if unique.iter().filter(|c| c.append_consistent).count() == 1 {
-        let outcome = unique.into_iter().find(|c| c.append_consistent).unwrap().outcome;
-        return Ok((outcome, true));
+    Ok(out)
+
+}
+
+/// What a compressed-path element is decoded against: the entity's exposed-id property
+/// table, and -- when the caller tracks them -- that entity's current property values.
+///
+/// The values matter because a path's bit layout depends on the *live* length of every
+/// `Array` it crosses; without them [`walk_path`] has to try each length and keep every
+/// self-consistent parse. See [`crate::app::dispatch::EntityDispatch::properties`] for the
+/// table itself.
+#[derive(Debug, Clone, Copy)]
+pub struct PropertyPathConfig<'a> {
+    pub table: &'a [PropertyDef],
+    pub values: Option<&'a HashMap<Arc<str>, Value>>,
+}
+
+impl<'a> PropertyPathConfig<'a> {
+
+    /// Decode against the table alone, guessing every `Array` length.
+    pub fn new(table: &'a [PropertyDef]) -> Self {
+        Self { table, values: None }
     }
 
-    let outcomes: Vec<&PathOutcome> = unique.iter().map(|c| &c.outcome).collect();
-    Err(io::Error::new(io::ErrorKind::InvalidData,
-        format!("entity property path: ambiguous decode, {} distinct candidates matched: {outcomes:?}", unique.len())))
+    /// Decode against the table and the entity's tracked values, which pin those lengths.
+    pub fn with_values(table: &'a [PropertyDef], values: Option<&'a HashMap<Arc<str>, Value>>) -> Self {
+        Self { table, values }
+    }
 
 }
 
@@ -2207,71 +2266,46 @@ fn decode_compressed_path(top: &[PropertyDef], data: &[u8], is_slice: bool) -> i
 /// see [`crate::app::dispatch::EntityDispatch::properties`]. Decoded per the real
 /// engine's `PropertyChangeReader::readCompressedPathAndApply`
 /// (`entitydef/property_change_reader.cpp`, see [`walk_path`]).
-///
-/// This message is the standard, generic BigWorld property-sync path for updating a
-/// single element of a replicated array/dict property -- e.g. WoT's own
-/// `NetworkReplicationPointComponent.status` (an array of `{prefabPath, recreateMethod,
-/// networkID, parentID, active}` dicts feeding `cgf_network`'s `ObjectCommand`/
-/// `ReplicationState` API, see `project_wot_proxy_debug_session` memory) uses exactly
-/// this message (its `setNested_status` callback) for per-element updates -- genuinely
-/// unrelated to the WoT-specific `Nrl*` binary messages despite superficially serving a
-/// similar purpose.
-///
-/// Decoding a path that crosses an `Array` (whose current length isn't known statically,
-/// unlike a `Tuple`) requires guessing that length by brute-force search over the
-/// remaining bytes (bounded, [`MAX_SEQ_LEN_GUESS`]) for the one length that makes the
-/// rest of the message parse cleanly to the very last byte -- the same self-describing-
-/// search technique already used for `NrlCreateNode::VehiclePrefab`. This is inherent to
-/// this project having no per-entity-instance state tracking (the real engine instead
-/// tracks each array's live length as it goes); an ambiguous or inconclusive guess
-/// surfaces as a decode error rather than a silently wrong pick.
-///
-/// Two concrete, confirmed (via a hand-built unit test, `compressed_path_tests`) ways
-/// this guessing can produce a genuine false positive, both inherent to the technique
-/// rather than a decoding bug: (1) an all-zero (or otherwise plausible-looking) padding
-/// byte between the bit-packed path and the byte-aligned value data can itself parse as
-/// a valid short value (e.g. an empty `STRING`) under a *different* wrong length guess
-/// whose own `align_to_byte` lands earlier, inside that padding; (2) for a
-/// [`SliceEntityProperty`] specifically, once a guessed length is large enough that
-/// `start`/`end` trivially satisfy `<= length`, a *different* `idx_bits` bracket that
-/// happens to round up to the *same* byte-aligned offset can reinterpret the same bits
-/// as a different, equally self-consistent `start`/`end` pair over the exact same
-/// trailing value bytes. Both surface correctly as an "ambiguous decode" error rather
-/// than a silent wrong pick, but reduce how often a real `Array`-crossing path decodes
-/// at all -- not yet verified byte-exact against a real live capture, where these
-/// collisions' actual frequency on real data is unknown.
 #[derive(Debug, Clone)]
-pub struct NestedEntityProperty {
-    /// The path from the entity's top-level property list down to the changed field,
-    /// e.g. `[Field("status"), Index(3), Field("active")]`.
-    pub path: Vec<EntityPropertyPathStep>,
-    pub value: Value,
+pub enum NestedEntityProperty {
+    /// The path resolved to exactly one field.
+    Known {
+        /// The path from the entity's top-level property list down to the changed field,
+        /// e.g. `[Field("status"), Index(3), Field("active")]`.
+        path: Vec<EntityPropertyPathStep>,
+        value: Value,
+    },
+    /// The path could not be resolved -- see [`SliceEntityProperty::Unknown`], which this
+    /// shares its reasoning with.
+    Unknown { data: Vec<u8>, reason: String },
 }
 
 impl NestedEntityProperty {
     pub const ID: u8 = id::NESTED_ENTITY_PROPERTY;
 }
 
-impl Element<[PropertyDef]> for NestedEntityProperty {
+impl Element<PropertyPathConfig<'_>> for NestedEntityProperty {
 
-    fn write_length(&self, _config: &[PropertyDef]) -> io::Result<ElementLength> {
+    fn write_length(&self, _config: &PropertyPathConfig<'_>) -> io::Result<ElementLength> {
         unreachable!("NestedEntityProperty is read-only")
     }
 
-    fn write(&self, _write: &mut dyn Write, _config: &[PropertyDef]) -> io::Result<u8> {
+    fn write(&self, _write: &mut dyn Write, _config: &PropertyPathConfig<'_>) -> io::Result<u8> {
         unreachable!("NestedEntityProperty is read-only")
     }
 
-    fn read_length(_config: &[PropertyDef], _id: u8) -> io::Result<ElementLength> {
+    fn read_length(_config: &PropertyPathConfig<'_>, _id: u8) -> io::Result<ElementLength> {
         Ok(ElementLength::Variable16)
     }
 
-    fn read(read: &mut dyn Read, config: &[PropertyDef], len: usize, _id: u8) -> io::Result<Self> {
+    fn read(read: &mut dyn Read, config: &PropertyPathConfig<'_>, len: usize, _id: u8) -> io::Result<Self> {
         let mut data = vec![0u8; len];
         read.read_exact(&mut data)?;
-        match decode_compressed_path(config, &data, false)?.0 {
-            PathOutcome::Single { path, value } => Ok(Self { path, value }),
-            PathOutcome::Slice { .. } => unreachable!("decode_compressed_path(is_slice=false) always returns Single"),
+        match decode_compressed_path(config.table, config.values, &data, false) {
+            Ok(PathOutcome::Single { path, value }) => Ok(Self::Known { path, value }),
+            Ok(PathOutcome::Slice { .. }) =>
+                unreachable!("decode_compressed_path(is_slice=false) always returns Single"),
+            Err(e) => Ok(Self::Unknown { data, reason: e.to_string() }),
         }
     }
 
@@ -2280,33 +2314,93 @@ impl Element<[PropertyDef]> for NestedEntityProperty {
 /// A client-directed update replacing a contiguous range of a replicated `Array`
 /// property's elements (Python-slice semantics: `array[start..end] = values`, an empty
 /// `values` meaning pure removal) -- see [`NestedEntityProperty`]'s doc comment, which
-/// this shares its path-decoding algorithm and live-length-guessing caveat with. Not yet
-/// verified byte-exact against a real live capture.
+/// this shares its path-decoding algorithm with.
 #[derive(Debug, Clone)]
-pub struct SliceEntityProperty {
-    /// The path from the entity's top-level property list down to the changed `Array`.
-    pub path: Vec<EntityPropertyPathStep>,
-    pub start: u32,
-    pub end: u32,
-    pub values: Vec<Value>,
-    /// `true` when several interpretations parsed and this one was chosen only for being
-    /// the single append-consistent reading -- see [`decode_compressed_path`] for the rule
-    /// and the deletion case it gets wrong. Report it distinctly from a certain decode.
-    pub seq_len_inferred: bool,
+pub enum SliceEntityProperty {
+    /// The path resolved to exactly one `Array` range.
+    Known {
+        /// The path from the entity's top-level property list down to the changed `Array`.
+        path: Vec<EntityPropertyPathStep>,
+        start: u32,
+        end: u32,
+        values: Vec<Value>,
+    },
+    /// The path could not be resolved: no length guess parsed cleanly, or several did and
+    /// the `Array` length is therefore undetermined (which tracking the entity's property
+    /// values prevents -- see [`PropertyPathConfig`]).
+    ///
+    /// Not an `Err`, deliberately, and for the same reason as [`MethodCall::Unknown`]: the
+    /// element is `Variable16`, so it is fully framed regardless, and the bundle reader
+    /// *rolls back* on a read error -- returning one would leave the element unconsumed
+    /// and force the caller to abandon every element after it. Carries the raw payload so
+    /// the failure stays diagnosable.
+    Unknown { data: Vec<u8>, reason: String },
 }
 
 impl SliceEntityProperty {
     pub const ID: u8 = id::SLICE_ENTITY_PROPERTY;
 }
 
-impl Element<[PropertyDef]> for SliceEntityProperty {
+impl Element<PropertyPathConfig<'_>> for SliceEntityProperty {
 
-    fn write_length(&self, _config: &[PropertyDef]) -> io::Result<ElementLength> {
+    fn write_length(&self, _config: &PropertyPathConfig<'_>) -> io::Result<ElementLength> {
         unreachable!("SliceEntityProperty is read-only")
     }
 
-    fn write(&self, _write: &mut dyn Write, _config: &[PropertyDef]) -> io::Result<u8> {
+    fn write(&self, _write: &mut dyn Write, _config: &PropertyPathConfig<'_>) -> io::Result<u8> {
         unreachable!("SliceEntityProperty is read-only")
+    }
+
+    fn read_length(_config: &PropertyPathConfig<'_>, _id: u8) -> io::Result<ElementLength> {
+        Ok(ElementLength::Variable16)
+    }
+
+    fn read(read: &mut dyn Read, config: &PropertyPathConfig<'_>, len: usize, _id: u8) -> io::Result<Self> {
+        let mut data = vec![0u8; len];
+        read.read_exact(&mut data)?;
+        match decode_compressed_path(config.table, config.values, &data, true) {
+            Ok(PathOutcome::Slice { path, start, end, values }) =>
+                Ok(Self::Known { path, start, end, values }),
+            Ok(PathOutcome::Single { .. }) =>
+                unreachable!("decode_compressed_path(is_slice=true) always returns Slice"),
+            Err(e) => Ok(Self::Unknown { data, reason: e.to_string() }),
+        }
+    }
+
+}
+
+/// A client-directed update carrying whole values for one or more of the *selected*
+/// entity's client-visible properties -- the same `(exposed id, value)` run that an
+/// entity's creation payload carries, see [`read_changed_properties`].
+///
+/// Written by the same `EntityCache::addChangedProperties` as [`CreateEntity::client_data`],
+/// just with a bundle header instead of inside the create: the engine sends it when an
+/// entity crosses into a nearer level of detail, so these are the properties that were
+/// *not* in the create (`addOuterDetailLevel` only sends the outermost level's).
+/// `ServerConnection::updateEntity` applies it to `selectedEntityID_`, so it is targeted
+/// by the preceding `SelectEntity`/`SelectPlayerEntity`, exactly like `ENTITY_PROPERTY`.
+#[derive(Debug, Clone)]
+pub enum UpdateEntity {
+    /// Every property in the run, as `(exposed id, name, value)`. Possibly empty: a
+    /// payload with nothing to send carries no bytes at all.
+    Known(Vec<(u8, Arc<str>, Value)>),
+    /// The run could not be decoded -- same contract as [`SliceEntityProperty::Unknown`],
+    /// including why this is not an `Err`.
+    Unknown { data: Vec<u8>, reason: String },
+}
+
+impl UpdateEntity {
+    pub const ID: u8 = id::UPDATE_ENTITY;
+}
+
+impl Element<[PropertyDef]> for UpdateEntity {
+
+    fn write_length(&self, _config: &[PropertyDef]) -> io::Result<ElementLength> {
+        unreachable!("UpdateEntity is read-only")
+    }
+
+    fn write(&self, _write: &mut dyn Write, _config: &[PropertyDef]) -> io::Result<u8> {
+        unreachable!("UpdateEntity is read-only")
     }
 
     fn read_length(_config: &[PropertyDef], _id: u8) -> io::Result<ElementLength> {
@@ -2316,17 +2410,13 @@ impl Element<[PropertyDef]> for SliceEntityProperty {
     fn read(read: &mut dyn Read, config: &[PropertyDef], len: usize, _id: u8) -> io::Result<Self> {
         let mut data = vec![0u8; len];
         read.read_exact(&mut data)?;
-        let (outcome, seq_len_inferred) = decode_compressed_path(config, &data, true)?;
-        match outcome {
-            PathOutcome::Slice { path, start, end, values } =>
-                Ok(Self { path, start, end, values, seq_len_inferred }),
-            PathOutcome::Single { .. } => unreachable!("decode_compressed_path(is_slice=true) always returns Slice"),
+        match read_changed_properties(&mut &data[..], config, len) {
+            Ok(values) => Ok(Self::Known(values)),
+            Err(e) => Ok(Self::Unknown { data, reason: e.to_string() }),
         }
     }
 
 }
-
-pub type UpdateEntity = DebugElementVariable16<{ id::UPDATE_ENTITY }>;
 pub type SetCellAppExtAddress = DebugElementVariable16<{ id::SET_CELL_APP_EXT_ADDRESS }>;
 pub type LastProxyMessageAfterDirectCellAppConnection = DebugElementVariable16<{ id::LAST_PROXY_MESSAGE_AFTER_DIRECT_CELL_APP_CONNECTION }>;
 
@@ -2607,6 +2697,10 @@ mod tests {
     /// of this brute-force approach for weakly-typed array elements, not a bug -- this
     /// test picks a type that actually exercises the disambiguating power the technique
     /// relies on for realistic (mostly `Dict`-of-typed-fields) array elements.
+    fn const_hex(hex: &str) -> Vec<u8> {
+        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+    }
+
     fn test_properties() -> (Vec<PropertyDef>, Ty, Ty, Ty) {
         let mut sys = TySystem::default();
         let u8_ty = sys.find("UINT8").unwrap();
@@ -2627,6 +2721,56 @@ mod tests {
         (properties, u16_ty, string_ty, u8_ty)
     }
 
+    /// `read_changed_properties` against bytes taken verbatim off the wire.
+    ///
+    /// Captured `CreateEntityDetailed` for a `SPGZone` (an artillery strike marker, whose
+    /// whole def is `<Parent>AreaOfEffect</Parent>`), so this pins three things at once:
+    /// the `count + (exposed id, value)` framing, the inherited property set, and the
+    /// size-sorted exposed order `vehicleID, equipmentID, launchTime, strikeTime`.
+    #[test]
+    fn changed_properties_from_a_live_create() {
+
+        let mut sys = TySystem::default();
+        let i32_ty = sys.find("INT32").unwrap();
+        let f64_ty = sys.find("FLOAT64").unwrap();
+
+        // AreaOfEffect's client-visible properties, in the order `build_property_table`
+        // produces (two 4-byte, then two 8-byte).
+        let properties = vec![
+            PropertyDef { name: Arc::from("vehicleID"), ty: i32_ty.clone(), length: ElementLength::Fixed(4) },
+            PropertyDef { name: Arc::from("equipmentID"), ty: i32_ty, length: ElementLength::Fixed(4) },
+            PropertyDef { name: Arc::from("launchTime"), ty: f64_ty.clone(), length: ElementLength::Fixed(8) },
+            PropertyDef { name: Arc::from("strikeTime"), ty: f64_ty, length: ElementLength::Fixed(8) },
+        ];
+
+        let data = const_hex("0400e729890001e53600000266666666b66601410366666666e6660141");
+        let mut read = &data[..];
+        let values = read_changed_properties(&mut read, &properties, data.len()).unwrap();
+
+        assert!(read.is_empty(), "must consume the payload exactly, {} bytes left", read.len());
+
+        let named: Vec<(u8, &str)> = values.iter().map(|(id, name, _)| (*id, &**name)).collect();
+        assert_eq!(named, [
+            (0, "vehicleID"), (1, "equipmentID"), (2, "launchTime"), (3, "strikeTime"),
+        ]);
+
+        assert_eq!(values[0].2, Value::Int32(8989159), "a live vehicle id from that battle");
+        assert_eq!(values[1].2, Value::Int32(14053));
+
+        let (Value::Float64(launch), Value::Float64(strike)) = (&values[2].2, &values[3].2) else {
+            panic!("launch/strike should be FLOAT64");
+        };
+        assert!((strike - launch - 6.0).abs() < 1e-6,
+            "the strike lands 6s after launch, got {launch} -> {strike}");
+
+        // An empty payload is "nothing changed", not a malformed count:
+        // `addChangedProperties` returns before writing the count when it finds nothing to
+        // send, and `BWEntity::onProperties` matches that with an up-front
+        // `if (!data.remainingLength()) return;`.
+        assert!(read_changed_properties(&mut &[][..], &properties, 0).unwrap().is_empty());
+
+    }
+
     #[test]
     fn nested_dict_field() {
 
@@ -2644,42 +2788,39 @@ mod tests {
         Value::UInt16(300).write(&mut data, &u16_ty).unwrap();
 
         let mut cursor = io::Cursor::new(&data[..]);
-        let result = NestedEntityProperty::read(&mut cursor, &properties, data.len(), NestedEntityProperty::ID).unwrap();
+        let config = PropertyPathConfig::new(&properties);
+        let result = NestedEntityProperty::read(&mut cursor, &config, data.len(), NestedEntityProperty::ID).unwrap();
 
-        assert!(matches!(&result.path[..],
+        let NestedEntityProperty::Known { path, value } = result else {
+            panic!("expected a resolved path, got {result:?}");
+        };
+        assert!(matches!(&path[..],
             [EntityPropertyPathStep::Field(f), EntityPropertyPathStep::Field(b)]
             if &**f == "foo" && &**b == "b"));
-        assert!(matches!(result.value, Value::UInt16(300)));
+        assert!(matches!(value, Value::UInt16(300)));
 
     }
 
-    /// Exercises `walk_path` directly (rather than the full [`SliceEntityProperty`]
-    /// codec) and only checks that the intended decode is *among* its candidates --
-    /// not that it's the unique one. `decode_compressed_path`'s brute-force length
-    /// guessing has a real, inherent blind spot this test tripped over while being
-    /// written: for a guessed count large enough that `start`/`end` trivially satisfy
-    /// `<= count`, a *different* `idx_bits` bracket that happens to round up to the
-    /// *same* byte-aligned offset (`align_to_byte`) can reinterpret the same bits as a
-    /// different, but equally self-consistent, `start`/`end` pair over the exact same
-    /// trailing value bytes -- e.g. `idx_bits=3` (`start=2,end=4`) and `idx_bits=5`
-    /// (`start=10,end=15`) both round up to the same byte boundary here, so both
-    /// "parse cleanly to the last byte". This is a property of the technique itself
-    /// (not a decoding bug), so a hand-built test for it should check the core
-    /// recursive logic finds the *right* candidate, not that no wrong one exists too.
+    /// Without a tracked value for the `Array` it crosses, a slice path is undecodable.
+    ///
+    /// The bit width of the index and range fields is a function of the array's live
+    /// length, which is not in the type. This used to brute-force the length and accept
+    /// any guess that parsed cleanly to the last byte; that guess could never be
+    /// confirmed, so it is gone. Not knowing is now reported as not knowing.
     #[test]
-    fn slice_array_range() {
+    fn slice_array_range_without_tracked_length_is_undecodable() {
 
         let (properties, _, string_ty, _) = test_properties();
 
-        // Path: top[1] = "bar" (an Array<STRING>, real length 5) -> leaf slice [2..4).
+        // Exactly the payload the tracked-length test below decodes, byte for byte.
         let mut bits = [0u8; 2];
         let mut w = BitWriter::new(&mut bits);
-        w.add(1, 1); // continue into "bar"
-        w.add(bits_required(2), 1); // index 1 = "bar"
-        w.add(1, 0); // stop: the leaf is "bar" itself
-        let idx_bits = bits_required(5 + 1); // real (live) array length is 5
-        w.add(idx_bits, 2); // start
-        w.add(idx_bits, 4); // end
+        w.add(1, 1);
+        w.add(bits_required(2), 1); // index 1 = "bar", an Array<STRING>
+        w.add(1, 0);
+        let idx_bits = bits_required(5 + 1);
+        w.add(idx_bits, 2);
+        w.add(idx_bits, 4);
 
         let mut data = bits.to_vec();
         Value::String(StringValue::String("ab".to_string())).write(&mut data, &string_ty).unwrap();
@@ -2687,15 +2828,68 @@ mod tests {
 
         let mut out = Vec::new();
         let mut budget = 200_000u32;
-        walk_path(PathContainer::Top(&properties), BitReader::new(&data), Vec::new(), true, &mut budget, &mut out);
+        walk_path(PathContainer::Top(&properties), None, None,
+            BitReader::new(&data), Vec::new(), true, &mut budget, &mut out);
 
-        assert!(out.iter().map(|c| &c.outcome).any(|outcome| matches!(outcome, PathOutcome::Slice { path, start: 2, end: 4, values }
+        assert!(out.is_empty(), "an untracked Array length must yield no reading, got {out:?}");
+
+        // And the element surfaces that as `Unknown` rather than an error, so the bundle
+        // keeps going -- see `SliceEntityProperty::Unknown`.
+        let mut cursor = io::Cursor::new(&data[..]);
+        let config = PropertyPathConfig::new(&properties);
+        let decoded = SliceEntityProperty::read(&mut cursor, &config, data.len(), SliceEntityProperty::ID).unwrap();
+        assert!(matches!(decoded, SliceEntityProperty::Unknown { .. }), "got {decoded:?}");
+
+    }
+
+    /// The same slice, decoded against the entity's *tracked* value instead of by guessing.
+    ///
+    /// An `Array`'s live length decides how many bits its index and range fields occupy,
+    /// so without it the decoder tries every length and keeps each self-consistent parse --
+    /// several of which can survive (measured live: of 46 slice updates in one battle, 9
+    /// were ambiguous outright and 9 more rested on the append tie-break). Given the real
+    /// length there is exactly one reading, and nothing is inferred.
+    #[test]
+    fn slice_array_range_with_tracked_length() {
+
+        let (properties, _, string_ty, _) = test_properties();
+
+        let mut bits = [0u8; 2];
+        let mut w = BitWriter::new(&mut bits);
+        w.add(1, 1);
+        w.add(bits_required(2), 1); // index 1 = "bar"
+        w.add(1, 0);
+        let idx_bits = bits_required(5 + 1); // live length 5, as tracked below
+        w.add(idx_bits, 2);
+        w.add(idx_bits, 4);
+
+        let mut data = bits.to_vec();
+        Value::String(StringValue::String("ab".to_string())).write(&mut data, &string_ty).unwrap();
+        Value::String(StringValue::String("xyz".to_string())).write(&mut data, &string_ty).unwrap();
+
+        // What the proxy tracks for this entity: "bar" currently holds 5 elements.
+        let tracked = HashMap::from([(
+            Arc::from("bar"),
+            Value::Seq((0..5).map(|i| Value::String(StringValue::String(format!("e{i}")))).collect()),
+        )]);
+
+        let mut out = Vec::new();
+        let mut budget = 200_000u32;
+        walk_path(PathContainer::Top(&properties), Some(&tracked), None,
+            BitReader::new(&data), Vec::new(), true, &mut budget, &mut out);
+
+        assert_eq!(out.len(), 1, "a tracked length must leave exactly one reading, got {:?}",
+            out);
+        assert!(matches!(&out[0], PathOutcome::Slice { path, start: 2, end: 4, values }
             if matches!(&path[..], [EntityPropertyPathStep::Field(f)] if &**f == "bar")
             && values == &[
                 Value::String(StringValue::String("ab".to_string())),
                 Value::String(StringValue::String("xyz".to_string())),
-            ])));
+            ]));
 
+        // And the element-level decode agrees, with nothing left undetermined.
+        let outcome = decode_compressed_path(&properties, Some(&tracked), &data, true).unwrap();
+        assert!(matches!(outcome, PathOutcome::Slice { start: 2, end: 4, .. }));
 
     }
 

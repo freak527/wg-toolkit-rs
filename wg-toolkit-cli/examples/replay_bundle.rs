@@ -141,12 +141,12 @@ fn main() {
                     }
                 }
                 else if id == NESTED_ENTITY_PROPERTY {
-                    match elt.read::<client_el::NestedEntityProperty, _>(&ed.properties) {
+                    match elt.read::<client_el::NestedEntityProperty, _>(&client_el::PropertyPathConfig::new(&ed.properties)) {
                         Ok(e) => { println!("[id=0x{id:02X}] NestedEntityProperty: {:?}", e.element); true }
                         Err(e) => { println!("[id=0x{id:02X}] NestedEntityProperty FAILED: {e}"); false }
                     }
                 } else if id == SLICE_ENTITY_PROPERTY {
-                    match elt.read::<client_el::SliceEntityProperty, _>(&ed.properties) {
+                    match elt.read::<client_el::SliceEntityProperty, _>(&client_el::PropertyPathConfig::new(&ed.properties)) {
                         Ok(e) => { println!("[id=0x{id:02X}] SliceEntityProperty: {:?}", e.element); true }
                         Err(e) => { println!("[id=0x{id:02X}] SliceEntityProperty FAILED: {e}"); false }
                     }

@@ -18,7 +18,7 @@ use std::path::Path;
 use wgtk::res::fs::ResFilesystem;
 use wgtk::script;
 use wgtk::app::dispatch::ScriptDispatch;
-use wgtk::app::client::element::{SliceEntityProperty, NestedEntityProperty};
+use wgtk::app::client::element::{SliceEntityProperty, NestedEntityProperty, PropertyPathConfig};
 use wgtk::net::element::Element;
 
 fn decode_hex(s: &str) -> Vec<u8> {
@@ -94,27 +94,29 @@ fn main() {
 
         for (label, data) in &decoded {
             let mut cursor = Cursor::new(&data[..]);
-            match SliceEntityProperty::read(&mut cursor, &ed.properties, data.len(), SliceEntityProperty::ID) {
-                Ok(p) => {
+            let config = PropertyPathConfig::new(&ed.properties);
+            match SliceEntityProperty::read(&mut cursor, &config, data.len(), SliceEntityProperty::ID) {
+                Ok(SliceEntityProperty::Known { path, start, end, values }) => {
                     slice_ok += 1;
-                    lines.push(format!("      SLICE{} {label}: path={:?} [{}..{}] = {:?}",
-                        if p.seq_len_inferred { "~" } else { " " }, p.path, p.start, p.end, p.values));
+                    lines.push(format!("      SLICE  {label}: path={path:?} [{start}..{end}] = {values:?}"));
                 }
-                // An "ambiguous" failure is a near miss worth seeing -- the path resolved
+                // An "ambiguous" outcome is a near miss worth seeing -- the path resolved
                 // and only the array-length guess was undecidable -- unlike "no consistent
                 // decode", which just means this table is wrong for these bytes.
-                Err(e) => {
-                    let e = e.to_string();
-                    if e.contains("ambiguous") {
+                Ok(SliceEntityProperty::Unknown { reason, .. }) => {
+                    if reason.contains("ambiguous") {
                         ambiguous += 1;
-                        lines.push(format!("      SLICE? {label}: {e}"));
+                        lines.push(format!("      SLICE? {label}: {reason}"));
                     }
                 }
+                Err(e) => lines.push(format!("      SLICE! {label}: {e}")),
             }
             let mut cursor = Cursor::new(&data[..]);
-            if let Ok(p) = NestedEntityProperty::read(&mut cursor, &ed.properties, data.len(), NestedEntityProperty::ID) {
+            if let Ok(NestedEntityProperty::Known { path, value }) =
+                NestedEntityProperty::read(&mut cursor, &config, data.len(), NestedEntityProperty::ID)
+            {
                 nested_ok += 1;
-                lines.push(format!("      NESTED {label}: path={:?} = {:?}", p.path, p.value));
+                lines.push(format!("      NESTED {label}: path={path:?} = {value:?}"));
             }
         }
 
