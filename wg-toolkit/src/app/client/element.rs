@@ -45,8 +45,8 @@ pub mod id {
     pub const CREATE_ENTITY: u8                                         = 0x0B;  // VAR 2
     pub const CREATE_ENTITY_DETAILED: u8                                = 0x0C;  // VAR 2
 
-    // --- Cell suspend/resume & client suspension detection (not in vanilla BigWorld,
-    // confirmed live via `re-work/frida/dump_interfaces.js`) ---
+    // --- Cell suspend/resume & client suspension detection (WoT additions, not in
+    // vanilla BigWorld) ---
     pub const CELL_APP_SUSPENDED: u8                                    = 0x0D;  // FIXED 0
     pub const CELL_APP_RESUMED: u8                                      = 0x0E;  // FIXED 0
     pub const CLIENT_SUSPENSION_DETECTION_ENABLED: u8                   = 0x0F;  // FIXED 4
@@ -91,50 +91,40 @@ pub mod id {
     // {NoAlias 4-byte EntityID, Alias 1-byte IDAlias} x {FullPos 5-byte PackedXYZ,
     // OnGround 3-byte PackedXZ, NoPos none} x {YawPitchRoll 3 bytes, YawPitch 2 bytes,
     // Yaw 1 byte, NoDir none} suggests a fixed-size message per id (id field + pos field
-    // + dir field, in that order) -- but a live re-check of the registration table itself
-    // (`re-work/frida/dump_interfaces.js`, re-run 2026-08-31 against the running client)
-    // confirms all 24 of these ids (and the `entityMethod`/`entityProperty` ranges below)
-    // are genuinely registered with `lengthStyle=CALLBACK`, meaning the client computes
-    // each one's byte length via a dedicated per-message-handler function rather than
-    // storing one constant. The `Fixed(N)` values below are NOT approximations anymore,
-    // though -- static disassembly (radare2) of that length-computing function (vtable
-    // slot 3 on each id's handler object; confirmed to be a pure function of `this`, no
-    // other inputs) plus live calls into it via Frida (`re-work/frida/dump_avupmsg_lengths.js`)
-    // recovered the *exact* ground-truth byte length for all 24 ids directly from the
-    // client's own code, not by guessing from captures. The vanilla SDK formula above
-    // undercounts every single one of them (this project's original constants matched
-    // that undercounting formula, hence the connection-crash bug found and fixed for
-    // 0x35 below, and the still-open failure on 0x3C before this fix) -- see the doc
-    // comment on the `avatar_update_elements!` macro for the corrected per-id byte
-    // breakdown and how the discrepancy decomposes cleanly (every position/direction mode
-    // needs more bytes than the vanilla formula assumes, verified against 0x35's
-    // independently live-confirmed 12-byte length as ground truth). What those extra
-    // bytes actually *contain* is still unconfirmed -- would need disassembling the much
-    // larger stream-parsing function (vtable slot 4) to find out, not attempted here.
-    pub const AVATAR_UPDATE_NO_ALIAS_FULL_POS_YAW_PITCH_ROLL: u8        = 0x29;  // CALLBACK 0, confirmed exact as Fixed(15)
-    pub const AVATAR_UPDATE_NO_ALIAS_FULL_POS_YAW_PITCH: u8             = 0x2A;  // CALLBACK 0, confirmed exact as Fixed(13)
-    pub const AVATAR_UPDATE_NO_ALIAS_FULL_POS_YAW: u8                   = 0x2B;  // CALLBACK 0, confirmed exact as Fixed(12)
-    pub const AVATAR_UPDATE_NO_ALIAS_FULL_POS_NO_DIR: u8                = 0x2C;  // CALLBACK 0, confirmed exact as Fixed(11)
-    pub const AVATAR_UPDATE_NO_ALIAS_ON_GROUND_YAW_PITCH_ROLL: u8       = 0x2D;  // CALLBACK 0, confirmed exact as Fixed(12)
-    pub const AVATAR_UPDATE_NO_ALIAS_ON_GROUND_YAW_PITCH: u8            = 0x2E;  // CALLBACK 0, confirmed exact as Fixed(10)
-    pub const AVATAR_UPDATE_NO_ALIAS_ON_GROUND_YAW: u8                  = 0x2F;  // CALLBACK 0, confirmed exact as Fixed(9)
-    pub const AVATAR_UPDATE_NO_ALIAS_ON_GROUND_NO_DIR: u8               = 0x30;  // CALLBACK 0, confirmed exact as Fixed(8)
-    pub const AVATAR_UPDATE_NO_ALIAS_NO_POS_YAW_PITCH_ROLL: u8          = 0x31;  // CALLBACK 0, confirmed exact as Fixed(9)
-    pub const AVATAR_UPDATE_NO_ALIAS_NO_POS_YAW_PITCH: u8               = 0x32;  // CALLBACK 0, confirmed exact as Fixed(7)
-    pub const AVATAR_UPDATE_NO_ALIAS_NO_POS_YAW: u8                     = 0x33;  // CALLBACK 0, confirmed exact as Fixed(6)
-    pub const AVATAR_UPDATE_NO_ALIAS_NO_POS_NO_DIR: u8                  = 0x34;  // CALLBACK 0, confirmed exact as Fixed(5)
-    pub const AVATAR_UPDATE_ALIAS_FULL_POS_YAW_PITCH_ROLL: u8           = 0x35;  // CALLBACK 0, confirmed exact as Fixed(12) (originally found via live capture, now cross-confirmed via disassembly)
-    pub const AVATAR_UPDATE_ALIAS_FULL_POS_YAW_PITCH: u8                = 0x36;  // CALLBACK 0, confirmed exact as Fixed(10)
-    pub const AVATAR_UPDATE_ALIAS_FULL_POS_YAW: u8                      = 0x37;  // CALLBACK 0, confirmed exact as Fixed(9)
-    pub const AVATAR_UPDATE_ALIAS_FULL_POS_NO_DIR: u8                   = 0x38;  // CALLBACK 0, confirmed exact as Fixed(8)
-    pub const AVATAR_UPDATE_ALIAS_ON_GROUND_YAW_PITCH_ROLL: u8          = 0x39;  // CALLBACK 0, confirmed exact as Fixed(9)
-    pub const AVATAR_UPDATE_ALIAS_ON_GROUND_YAW_PITCH: u8               = 0x3A;  // CALLBACK 0, confirmed exact as Fixed(7)
-    pub const AVATAR_UPDATE_ALIAS_ON_GROUND_YAW: u8                     = 0x3B;  // CALLBACK 0, confirmed exact as Fixed(6)
-    pub const AVATAR_UPDATE_ALIAS_ON_GROUND_NO_DIR: u8                  = 0x3C;  // CALLBACK 0, confirmed exact as Fixed(5) -- this is the id that was previously failing live at the wrong Fixed(4)
-    pub const AVATAR_UPDATE_ALIAS_NO_POS_YAW_PITCH_ROLL: u8             = 0x3D;  // CALLBACK 0, confirmed exact as Fixed(6)
-    pub const AVATAR_UPDATE_ALIAS_NO_POS_YAW_PITCH: u8                  = 0x3E;  // CALLBACK 0, confirmed exact as Fixed(4)
-    pub const AVATAR_UPDATE_ALIAS_NO_POS_YAW: u8                        = 0x3F;  // CALLBACK 0, confirmed exact as Fixed(3)
-    pub const AVATAR_UPDATE_ALIAS_NO_POS_NO_DIR: u8                     = 0x40;  // CALLBACK 0, confirmed exact as Fixed(2)
+    // + dir field, in that order) -- but all 24 of these ids (and the
+    // `entityMethod`/`entityProperty` ranges below) are registered with
+    // `lengthStyle=CALLBACK`, meaning the client computes each one's byte length through
+    // a dedicated per-message-handler function rather than storing one constant.
+    //
+    // The `Fixed(N)` values below are that function's ground truth, read out of the
+    // client's own code (vtable slot 3 on each id's handler object, a pure function of
+    // `this`), not estimated from captures. They do not match the vanilla SDK formula
+    // above, which undercounts every one of them. See the doc comment on the
+    // `avatar_update_elements!` macro for the per-id byte layouts.
+    pub const AVATAR_UPDATE_NO_ALIAS_FULL_POS_YAW_PITCH_ROLL: u8        = 0x29;  // CALLBACK, Fixed(15)
+    pub const AVATAR_UPDATE_NO_ALIAS_FULL_POS_YAW_PITCH: u8             = 0x2A;  // CALLBACK, Fixed(13)
+    pub const AVATAR_UPDATE_NO_ALIAS_FULL_POS_YAW: u8                   = 0x2B;  // CALLBACK, Fixed(12)
+    pub const AVATAR_UPDATE_NO_ALIAS_FULL_POS_NO_DIR: u8                = 0x2C;  // CALLBACK, Fixed(11)
+    pub const AVATAR_UPDATE_NO_ALIAS_ON_GROUND_YAW_PITCH_ROLL: u8       = 0x2D;  // CALLBACK, Fixed(12)
+    pub const AVATAR_UPDATE_NO_ALIAS_ON_GROUND_YAW_PITCH: u8            = 0x2E;  // CALLBACK, Fixed(10)
+    pub const AVATAR_UPDATE_NO_ALIAS_ON_GROUND_YAW: u8                  = 0x2F;  // CALLBACK, Fixed(9)
+    pub const AVATAR_UPDATE_NO_ALIAS_ON_GROUND_NO_DIR: u8               = 0x30;  // CALLBACK, Fixed(8)
+    pub const AVATAR_UPDATE_NO_ALIAS_NO_POS_YAW_PITCH_ROLL: u8          = 0x31;  // CALLBACK, Fixed(9)
+    pub const AVATAR_UPDATE_NO_ALIAS_NO_POS_YAW_PITCH: u8               = 0x32;  // CALLBACK, Fixed(7)
+    pub const AVATAR_UPDATE_NO_ALIAS_NO_POS_YAW: u8                     = 0x33;  // CALLBACK, Fixed(6)
+    pub const AVATAR_UPDATE_NO_ALIAS_NO_POS_NO_DIR: u8                  = 0x34;  // CALLBACK, Fixed(5)
+    pub const AVATAR_UPDATE_ALIAS_FULL_POS_YAW_PITCH_ROLL: u8           = 0x35;  // CALLBACK, Fixed(12) (originally found via live capture, now cross-confirmed via disassembly)
+    pub const AVATAR_UPDATE_ALIAS_FULL_POS_YAW_PITCH: u8                = 0x36;  // CALLBACK, Fixed(10)
+    pub const AVATAR_UPDATE_ALIAS_FULL_POS_YAW: u8                      = 0x37;  // CALLBACK, Fixed(9)
+    pub const AVATAR_UPDATE_ALIAS_FULL_POS_NO_DIR: u8                   = 0x38;  // CALLBACK, Fixed(8)
+    pub const AVATAR_UPDATE_ALIAS_ON_GROUND_YAW_PITCH_ROLL: u8          = 0x39;  // CALLBACK, Fixed(9)
+    pub const AVATAR_UPDATE_ALIAS_ON_GROUND_YAW_PITCH: u8               = 0x3A;  // CALLBACK, Fixed(7)
+    pub const AVATAR_UPDATE_ALIAS_ON_GROUND_YAW: u8                     = 0x3B;  // CALLBACK, Fixed(6)
+    pub const AVATAR_UPDATE_ALIAS_ON_GROUND_NO_DIR: u8                  = 0x3C;  // CALLBACK, Fixed(5) -- not the Fixed(4) the vanilla formula gives
+    pub const AVATAR_UPDATE_ALIAS_NO_POS_YAW_PITCH_ROLL: u8             = 0x3D;  // CALLBACK, Fixed(6)
+    pub const AVATAR_UPDATE_ALIAS_NO_POS_YAW_PITCH: u8                  = 0x3E;  // CALLBACK, Fixed(4)
+    pub const AVATAR_UPDATE_ALIAS_NO_POS_YAW: u8                        = 0x3F;  // CALLBACK, Fixed(3)
+    pub const AVATAR_UPDATE_ALIAS_NO_POS_NO_DIR: u8                     = 0x40;  // CALLBACK, Fixed(2)
 
     // --- Entity control, voice & session hand-off ---
     pub const CONTROL_ENTITY: u8                                        = 0x41;  // FIXED 5
@@ -264,13 +254,12 @@ impl SimpleElement for ResetEntities {
 /// fork's wire layout is NOT a plain byte-for-byte match for vanilla 14.4.1's `stream >>
 /// spaceID_ >> vehicleID >> pos >> packedXZScale_ >> dir` (same as [`CreateBasePlayer`]
 /// needing extra fields vanilla doesn't have) -- it inserts a leading byte and widens the
-/// space between `space_id` and `vehicle_id` by a 2-byte field, confirmed against real
-/// capture bytes: `packed_xz_scale` came out byte-for-byte identical across two different
-/// battles (a per-server-config constant, as expected) and `position`/`direction` came out
-/// as plausible in-map meter-scale values, both of which failed completely under the old
-/// (wrong) offsets. `direction` is still assumed to be 3 raw `f32`s (yaw/pitch/roll,
-/// BigWorld's conventional `Direction3D` layout) -- unconfirmed beyond "values are in a
-/// plausible radian range". There's also no generated per-entity "cell properties" struct
+/// space between `space_id` and `vehicle_id` by a 2-byte field. `packed_xz_scale` is
+/// constant per server configuration, identical across battles.
+///
+/// `direction` is assumed to be 3 raw `f32`s (yaw/pitch/roll, BigWorld's conventional
+/// `Direction3D` layout); nothing establishes that beyond the values falling in a
+/// plausible radian range. There's also no generated per-entity "cell properties" struct
 /// yet (unlike `entity_data: Codec<()>` on [`CreateBasePlayer`], entities only have
 /// base-exposed properties modelled today), so the trailing property-dict stream is
 /// carried as a raw pre-encoded blob (`cell_data`) the caller must build.
@@ -390,10 +379,9 @@ impl CreateBasePlayer<'_> {
     fn read_suffix(read: &mut dyn Read, entity_id: u32, entity_type_id: u16, data_ty: &Ty) -> io::Result<Self> {
         let entity_data = Value::read(read, data_ty)?;
         let entity_components_count = read.read_u8()?;
-        // TEMPORARY diagnostic: dump whatever trailing bytes follow the count so a live
-        // capture with a nonzero count (previously never seen) can finally show the
-        // per-component wire encoding this project doesn't understand yet -- see this
-        // struct's `entity_components_count` doc comment.
+        // Diagnostic: dump whatever trailing bytes follow a nonzero count, which is the
+        // only way to learn the per-component wire encoding -- see this struct's
+        // `entity_components_count` doc comment.
         if entity_components_count != 0 {
             let mut trailer = Vec::new();
             read.read_to_end(&mut trailer)?;
@@ -471,7 +459,25 @@ impl Element<EntityDispatch> for CreateBasePlayer<'_> {
 // Spaces & general entity lifecycle (creation, AoI enter/leave)
 // =============================================================================
 
+/// Filler the server can put in a bundle to pad it out; carries no game state.
+///
+/// Body not decoded, and never seen on the wire, so even its length style is only
+/// inferred from the id table.
 pub type DummyPacket = DebugElementVariable16<{ id::DUMMY_PACKET }>;
+/// One space-data record: a property of the space the player is in.
+///
+/// Three arrive together on entering a space, each beginning with the space id followed
+/// by a field taking the values 0, 1 and 2. Those are the values vanilla BigWorld uses
+/// for `SPACE_DATA_TOD_KEY`, `SPACE_DATA_MAPPING_KEY_CLIENT_SERVER` and
+/// `SPACE_DATA_MAPPING_KEY_CLIENT_ONLY` (`common/space_data_types.hpp`), but the
+/// payloads are far too short for those keys' structs, so the correspondence is unproven
+/// and the field's width is unknown -- `u32`, or `u16` plus two unknown bytes, fit the
+/// bytes equally.
+///
+/// Every payload observed is zero apart from the space id, and identical between
+/// different maps, so the records appear to be fixed stubs in this client. Body not
+/// decoded. Geometry mappings do *not* arrive here despite the key values above; they
+/// have their own element, [`AddSpaceGeometryMapping`].
 pub type SpaceProperty = DebugElementVariable16<{ id::SPACE_PROPERTY }>;
 /// Maps a geometry (terrain/scene) resource into a space, with the transform to place it.
 ///
@@ -538,6 +544,11 @@ impl SimpleElement for AddSpaceGeometryMapping {
     const ID: u8 = id::ADD_SPACE_GEOMETRY_MAPPING;
     const LEN: ElementLength = ElementLength::Variable16;
 }
+/// Unmaps a geometry resource previously attached by [`AddSpaceGeometryMapping`],
+/// presumably naming the entry by its `SpaceEntryID`.
+///
+/// Body not decoded, and never seen on the wire -- unsurprising, since a battle tears
+/// its space down by disconnecting rather than by unmapping geometry.
 pub type RemoveSpaceGeometryMapping = DebugElementVariable16<{ id::REMOVE_SPACE_GEOMETRY_MAPPING }>;
 
 /// Sent from the cell when another entity (not the client's own player) enters its Area
@@ -748,14 +759,14 @@ impl SimpleElement for CreateEntityDetailed {
     const LEN: ElementLength = ElementLength::Variable16;
 }
 
-// `cellAppSuspended`/`cellAppResumed`/`clientSuspensionDetectionEnabled` don't exist in
-// the leaked BigWorld 14.4.1 SDK at all (like the `Nrl*` elements above, apparently a
-// later-engine or WoT-specific addition) -- their names and fixed lengths below are
-// instead confirmed live by dumping the real client's own registered `ClientInterface`
-// message table (`re-work/frida/dump_interfaces.js`, ids `0x0D`-`0x0F`), which is where
-// this project's names for them (and the `id` module's byte counts) originally came
-// from; there's no header to cross-check field-level semantics against, though, so
-// [`ClientSuspensionDetectionEnabled`]'s single field is a plausible guess, not confirmed.
+// `cellAppSuspended`/`cellAppResumed`/`clientSuspensionDetectionEnabled` (ids
+// `0x0D`-`0x0F`) do not exist in the vanilla BigWorld 14.4.1 SDK; like the `Nrl*`
+// elements above, they are a later-engine or WoT-specific addition. Their names and
+// fixed lengths come from the client's own registered `ClientInterface` message table.
+//
+// No header describes their field-level semantics, so
+// [`ClientSuspensionDetectionEnabled`]'s single field is a plausible reading rather than
+// an established one.
 
 crate::__struct_simple_codec! {
     /// Sent by the cell when it is about to be suspended (e.g. for a space/cell
@@ -805,8 +816,8 @@ crate::__struct_simple_codec! {
     /// Sent when an entity enters the client's Area of Interest -- see [`CreateEntity`]
     /// for the companion message carrying its initial snapshot. Layout confirmed against
     /// the leaked BigWorld 14.4.1 SDK (`connection/client_interface.hpp`'s `enterAoI`
-    /// message: `EntityID id; IDAlias idAlias;`), matching this project's own
-    /// already-confirmed 5-byte length for `ENTER_AOI`.
+    /// message: `EntityID id; IDAlias idAlias;`), matching the 5-byte length of
+    /// `ENTER_AOI`.
     #[derive(Debug, Clone, Copy)]
     pub struct EnterAoi {
         pub entity_id: u32,
@@ -823,8 +834,8 @@ crate::__struct_simple_codec! {
     /// Like [`EnterAoi`], but for an entity that enters while riding a vehicle (a
     /// passenger). Layout confirmed against the leaked BigWorld 14.4.1 SDK
     /// (`connection/client_interface.hpp`'s `enterAoIOnVehicle` message: `EntityID id;
-    /// EntityID vehicleID; IDAlias idAlias;`), matching this project's own
-    /// already-confirmed 9-byte length for `ENTER_AOI_ON_VEHICLE`.
+    /// EntityID vehicleID; IDAlias idAlias;`), matching the 9-byte length of
+    /// `ENTER_AOI_ON_VEHICLE`.
     #[derive(Debug, Clone, Copy)]
     pub struct EnterAoiOnVehicle {
         pub entity_id: u32,
@@ -897,6 +908,10 @@ impl SimpleElement for TickSync {
 }
 
 
+/// A periodic form of [`TickSync`], carrying two bytes rather than one.
+///
+/// Body not decoded, and never seen on the wire: this client sends the plain
+/// [`TickSync`] instead.
 pub type TickSyncPeriodic = DebugElementFixed<{ id::TICK_SYNC_PERIODIC }, 2>;
 
 crate::__struct_simple_codec! {
@@ -986,7 +1001,25 @@ impl SimpleElement for SelectEntity {
     const LEN: ElementLength = ElementLength::Fixed(4);
 }
 
-pub type SelectAliasedEntity = DebugElementFixed<{ id::SELECT_ALIASED_ENTITY }, 1>;
+crate::__struct_simple_codec! {
+    /// Sent by the server to re-target subsequent property/method elements at a nearby
+    /// entity, naming it by its one-byte Area-of-Interest alias rather than its full id.
+    ///
+    /// The compact counterpart to [`SelectEntity`]: `ServerConnection::selectAliasedEntity`
+    /// does `selectedEntityID_ = idAlias_[args.idAlias]`. Aliases are handed out by
+    /// [`EnterAoi`]/[`EnterAoiOnVehicle`] and are only meaningful against that table, so a
+    /// reader must track it to resolve one. An alias with no entry leaves the selection
+    /// undefined, and anything decoded against it afterwards would target the wrong entity.
+    #[derive(Debug, Clone, Copy)]
+    pub struct SelectAliasedEntity {
+        pub id_alias: u8,
+    }
+}
+
+impl SimpleElement for SelectAliasedEntity {
+    const ID: u8 = id::SELECT_ALIASED_ENTITY;
+    const LEN: ElementLength = ElementLength::Fixed(1);
+}
 
 
 crate::__struct_simple_codec! {
@@ -1044,7 +1077,7 @@ impl SimpleElement for ForcedPosition {
 // `EntityID`/`IDAlias` split as the `AVUPMSG` family above, `PlayerDetailed` omitting the
 // id entirely since it only ever targets the client's own player).
 //
-// That vanilla layout is 1 byte short of this project's own already-confirmed sizes
+// That vanilla layout is 1 byte short of the sizes used here
 // (28/25/24 vs the confirmed-live 29/26/25 -- see the `id` module), in all three cases by
 // exactly the same amount. The same SDK's `BaseAppExtInterface::avatarUpdateImplicit`
 // (`connection/baseapp_ext_interface.hpp`, the base-directed sibling of these) has a
@@ -1221,7 +1254,19 @@ avatar_update_elements! {
     AvatarUpdateAliasNoPosNoDir             { id_alias: u8,   position: (),        direction: (),                 unk: 0 } = AVATAR_UPDATE_ALIAS_NO_POS_NO_DIR, 2;
 }
 
+/// Updates an entity's volatile properties -- the frequently-changing position and
+/// direction fields that the `AVATAR_UPDATE_*` family otherwise carries.
+///
+/// Body not decoded, and never seen on the wire; this client receives the
+/// `AVATAR_UPDATE_*` elements instead. Related to [`ChangeVolatilePackerType`], which
+/// selects how such fields are packed.
 pub type AvatarUpdateVolatileProperties = DebugElementVariable16<{ id::AVATAR_UPDATE_VOLATILE_PROPERTIES }>;
+/// Switches the packing scheme used for volatile position/direction fields.
+///
+/// Relevant because the `AVATAR_UPDATE_*` family's packed layouts
+/// ([`crate::app::math::PackedXyz`], [`crate::app::math::PackedYawPitchRoll`]) assume a
+/// fixed bit allocation; a packer change would invalidate that assumption mid-stream.
+/// Body not decoded, and never seen on the wire, so no such change has had to be handled.
 pub type ChangeVolatilePackerType = DebugElementVariable16<{ id::CHANGE_VOLATILE_PACKER_TYPE }>;
 
 // =============================================================================
@@ -1848,7 +1893,7 @@ impl SimpleCodec for NrlUnreliableMsgToClient {
         if header != [0x06, 0x00, 0x01] {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
                 format!("NrlUnreliableMsgToClient: unrecognized header {header:02X?} \
-                    (only 06 00 01 confirmed live so far)")));
+                    (only 06 00 01 is known)")));
         }
         let unk_id_a = read.read_u32()?;
         let unk_id_b = read.read_u32()?;
@@ -1860,7 +1905,7 @@ impl SimpleCodec for NrlUnreliableMsgToClient {
         if class_tag != [0xD6, 0xC3, 0xC4, 0x00, 0x00, 0x01] {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
                 format!("NrlUnreliableMsgToClient: unrecognized class tag {class_tag:02X?} \
-                    (only D6 C3 C4 00 00 01 confirmed live so far)")));
+                    (only D6 C3 C4 00 00 01 is known)")));
         }
         let flags = read.read_u8()?;
         let zero = read.read_u8()?;
@@ -1908,7 +1953,7 @@ crate::__struct_simple_codec! {
     /// elements in [`super::super::base::element`]) rather than only passively receiving
     /// server-driven `AVATAR_UPDATE_*` elements for it. Layout confirmed against the
     /// leaked BigWorld 14.4.1 SDK (`connection/client_interface.hpp`'s `controlEntity`:
-    /// `EntityID id; bool on;`), matching this project's own already-confirmed 5-byte
+    /// `EntityID id; bool on;`), matching the 5-byte
     /// length for `CONTROL_ENTITY`.
     #[derive(Debug, Clone, Copy)]
     pub struct ControlEntity {
@@ -1922,7 +1967,16 @@ impl SimpleElement for ControlEntity {
     const LEN: ElementLength = ElementLength::Fixed(5);
 }
 
+/// Carries voice-chat audio from another player.
+///
+/// Body not decoded, and never seen on the wire -- it requires voice chat to be both
+/// enabled and in use by someone in the battle.
 pub type VoiceData = DebugElementVariable16<{ id::VOICE_DATA }>;
+/// Tells the client to restore its state after the server has moved or recovered it,
+/// for instance when a cell fails over.
+///
+/// The client answers with [`crate::app::base::element::RestoreClientAck`]. Body not
+/// decoded, and never seen on the wire: it needs a server-side failure to trigger it.
 pub type RestoreClient = DebugElementVariable16<{ id::RESTORE_CLIENT }>;
 
 
@@ -2057,7 +2111,7 @@ crate::__struct_simple_codec! {
     /// under local control (confirmed by `ServerConnection::detailedPosition`'s own
     /// `isControlledLocally` early-return). Layout confirmed against the leaked BigWorld
     /// 14.4.1 SDK (`connection/client_interface.hpp`'s `detailedPosition`: `Position3D
-    /// position; Direction3D direction;`), matching this project's own already-confirmed
+    /// position; Direction3D direction;`), matching the
     /// 24-byte length for `DETAILED_POSITION` exactly (unlike the `*Detailed` avatar
     /// update messages, no extra byte here).
     #[derive(Debug, Clone, Copy)]
@@ -2640,6 +2694,12 @@ impl SimpleElement for SetCellAppExtAddress {
     const ID: u8 = id::SET_CELL_APP_EXT_ADDRESS;
     const LEN: ElementLength = ElementLength::Variable16;
 }
+/// Marks the final message relayed through the BaseApp proxy before the client begins
+/// talking to a CellApp directly.
+///
+/// Body not decoded, and never seen on the wire: this client reaches the cell through the
+/// BaseApp for the whole session and never takes up a direct connection. See
+/// [`SetCellAppExtAddress`], which carries the address such a connection would use.
 pub type LastProxyMessageAfterDirectCellAppConnection = DebugElementVariable16<{ id::LAST_PROXY_MESSAGE_AFTER_DIRECT_CELL_APP_CONNECTION }>;
 
 // =============================================================================
@@ -2715,7 +2775,7 @@ impl Element<[MethodDef]> for EntityMethod {
 
         Ok(match id::ENTITY_METHOD.to_exposed_id_checked(config.len() as u16, id) {
             // An unrecognized exposed id falls back to Variable8 here instead of
-            // erroring -- confirmed live by hooking `getEntityMethodStreamSize` on a
+            // erroring -- matching `getEntityMethodStreamSize` on a
             // live client instance, which returns Mercury's
             // `DEFAULT_VARIABLE_LENGTH_HEADER_SIZE` sentinel (-1, i.e. "read 1 more
             // header byte") for an id it doesn't recognize either.
@@ -2824,25 +2884,22 @@ impl Element<[PropertyDef]> for EntityProperty {
         // No sub-id handling: `read_length` above already rejected any id outside the
         // known full-slot range before `read` is ever reached (see this type's doc
         // comment), so overflow sub-ids -- which would only ever be used for an id count
-        // this project doesn't have confirmed anyway -- can't occur here.
+        // which is not modelled here anyway -- can't occur here.
         let exposed_id = id::ENTITY_PROPERTY.to_exposed_id(config.len() as u16, id, || unreachable!(
             "read_length already rejected any id requiring a sub-id"));
 
         let def = config.get(exposed_id as usize)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unrecognized entity property exposed id: 0x{exposed_id:02X}")))?;
 
-        // A top-level `PYTHON` property is read directly from the *whole* remaining
-        // bytes of this already element-length-bounded reader, bypassing `Value::read`'s
-        // usual `PythonValue` codec (which additionally expects its own embedded packed
-        // length, correct for a `PYTHON` field nested inside a larger concatenated `Dict`
-        // -- e.g. `CreateBasePlayer`'s `initialServerSettings`, still working correctly
-        // as of this comment -- but confirmed live to systematically overrun here: this
-        // project has no way to know a standalone property's declared length ahead of
-        // time (see `property_length`'s own doc comment on its `Variable8` guess), but
-        // *this* element's own length is already known once we're inside `read` at all,
-        // and stacking a second, redundant inner length on top of it consistently asked
-        // for more bytes than remained). `EntityProperty`'s framing already fully
-        // delimits this property on its own, so no extra inner length is needed here.
+        // A top-level `PYTHON` property is read from the *whole* remaining bytes of this
+        // already element-length-bounded reader, bypassing `Value::read`'s usual
+        // `PythonValue` codec.
+        //
+        // That codec expects its own embedded packed length, which is right for a
+        // `PYTHON` field nested inside a larger concatenated `Dict` (such as
+        // `CreateBasePlayer`'s `initialServerSettings`) but wrong here: this element's
+        // length already delimits the property exactly, so a second inner length on top
+        // of it asks for more bytes than remain.
         let value = if matches!(def.ty.kind(), TyKind::Python) {
             let mut raw = Vec::new();
             read.read_to_end(&mut raw)?;
@@ -2869,7 +2926,7 @@ mod tests {
 
     use super::*;
 
-    /// A real `forcedPosition` body captured live (WoT v2.4.0.0), used to pin the field
+    /// A real `forcedPosition` body, pinning the field
     /// split: BigWorld's own layout accounts for only 36 of the declared 38 bytes, and
     /// the two extra sit *between* `vehicle_entity_id` and `position`, not at the end.
     /// Reading them at the end instead shifts `position` two bytes early and turns clean

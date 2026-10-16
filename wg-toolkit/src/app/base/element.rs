@@ -20,14 +20,11 @@ pub mod id {
 
     use crate::net::element::ElementIdRange;
 
-    // All ids below were confirmed empirically by attaching to a live game
-    // process (v2.3.1.3, 2026-08-24) and reading the actual registration
-    // order out of `BaseAppExtInterface`'s `Mercury::InterfaceMinder` in
-    // memory (from `baseapp_ext_interface.hpp`). Length style/param
-    // re-confirmed via a fresh re-run of `re-work/frida/dump_interfaces.js`
-    // (2026-08-31) -- unlike `client::element`'s `ClientInterface`, nothing
-    // in this whole interface uses `CALLBACK`; every id here really is
-    // either a fixed byte count or a `Variable16`-style dynamic size.
+    // The ids below follow the registration order of `BaseAppExtInterface`'s
+    // `Mercury::InterfaceMinder` (`baseapp_ext_interface.hpp`). Unlike
+    // `client::element`'s `ClientInterface`, nothing in this interface uses
+    // `CALLBACK`: every id here is either a fixed byte count or a
+    // `Variable16`-style dynamic size.
 
     // --- Login/session handshake & datacenter ping ---
     pub const LOGIN_KEY: u8                     = 0x00; // baseAppLogin, FIXED 7
@@ -155,7 +152,7 @@ pub type PingDatacenter = DebugElementFixed<{ id::PING_DATACENTER }, 10>;
 // (`connection/baseapp_ext_interface.hpp`'s `BaseAppExtInterface::avatarUpdateImplicit`/
 // `avatarUpdateExplicit`, specifically their `!VOLATILE_POSITIONS_ARE_ABSOLUTE` variant
 // -- confirmed still in effect for this build, see `network/msgtypes.hpp`), but each
-// comes out exactly 1 byte short of this project's own already-confirmed length (16 vs
+// comes out exactly 1 byte short of the length used here (16 vs
 // 17, 21 vs 22 -- both from live `BaseAppExtInterface` registration data, see the `id`
 // module). The same +1 discrepancy shows up independently in every other
 // `avatarUpdate*`-family message checked so far (all three client-directed `*Detailed`
@@ -223,7 +220,7 @@ crate::__struct_simple_codec! {
     /// [`super::super::client::element::ForcedPosition`], the server-directed message
     /// this replies to). No fields: confirmed against the leaked BigWorld 14.4.1 SDK
     /// (`connection/baseapp_ext_interface.hpp`'s `MF_EMPTY_BLOCKABLE_PROXY_MSG(
-    /// ackPhysicsCorrection )`), matching this project's own already-confirmed 0-byte
+    /// ackPhysicsCorrection )`), matching the 0-byte
     /// length exactly.
     #[derive(Debug, Default, Clone, Copy)]
     pub struct AckPhysicsCorrection {}
@@ -362,9 +359,28 @@ impl SimpleElement for NrlMsgToCell {
 // Ward avatar updates & session control
 // =============================================================================
 
+/// The [`AvatarUpdateImplicit`] form for a *ward*: an entity the client drives besides
+/// its own avatar, such as a towed or remotely controlled vehicle.
+///
+/// Twenty bytes, four more than [`AvatarUpdateImplicit`]'s payload, which is consistent
+/// with an extra entity id naming the ward. Body not decoded, and never seen on the
+/// wire -- no observed battle has given the client a second entity to drive.
 pub type AvatarUpdateWardImplicit = DebugElementFixed<{ id::AVATAR_UPDATE_WARD_IMPLICIT }, 20>;
+/// The [`AvatarUpdateExplicit`] form for a ward, stating the vehicle it is mounted on.
+/// Relates to [`AvatarUpdateWardImplicit`] exactly as [`AvatarUpdateExplicit`] does to
+/// [`AvatarUpdateImplicit`]. Body not decoded, and never seen on the wire.
 pub type AvatarUpdateWardExplicit = DebugElementFixed<{ id::AVATAR_UPDATE_WARD_EXPLICIT }, 29>;
+/// Acknowledges a server physics correction applied to a ward, the ward counterpart of
+/// [`AckPhysicsCorrection`].
+///
+/// Four bytes, presumably the ward's entity id. Body not decoded, and never seen on the
+/// wire.
 pub type AckWardPhysicsCorrection = DebugElementFixed<{ id::ACK_WARD_PHYSICS_CORRECTION }, 4>;
+/// Confirms the client has restored its state in response to
+/// [`crate::app::client::element::RestoreClient`].
+///
+/// Body not decoded, and never seen on the wire: it is only sent in answer to a restore,
+/// which needs a server-side failure to trigger.
 pub type RestoreClientAck = DebugElementFixed<{ id::RESTORE_CLIENT_ACK }, 4>;
 
 /// Keeps the client -> BaseApp connection alive. Carries no bytes: its presence in the

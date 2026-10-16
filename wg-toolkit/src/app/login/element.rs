@@ -21,13 +21,10 @@ use crate::util::io::*;
 
 /// Internal module containing all raw elements numerical ids.
 ///
-/// All ids below were confirmed empirically by attaching to a live game process
-/// (v2.3.1.3, 2026-08-24) and reading the actual registration order out of
-/// `LoginInterface`'s `Mercury::InterfaceMinder` in memory.
+/// The ids follow the registration order of `LoginInterface`'s
+/// `Mercury::InterfaceMinder`. None of them uses `CALLBACK`: every id is either a fixed
+/// byte count or a `Variable16`-style dynamic size.
 pub mod id {
-    // Length style/param re-confirmed via a fresh re-run of
-    // `re-work/frida/dump_interfaces.js` (2026-08-31) -- no `CALLBACK` ids in this
-    // interface either.
 
     // --- Login request (client -> server) ---
     pub const LOGIN_REQUEST: u8         = 0x00;  // VAR 2

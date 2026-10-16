@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{io, thread};
 
-use tracing::{error, info, warn, info_span, trace, trace_span};
+use tracing::{debug, error, info, warn, info_span, trace, trace_span};
 
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use flate2::read::ZlibDecoder;
@@ -711,7 +711,22 @@ impl proxy::Handler for BaseHandler {
         _packet: Packet,
         direction: proxy::PacketDirection,
     ) -> Result<(), Self::Error> {
-        error!(addr = %peer.addr(), "Failed to decrypt a packet: ({direction:?})");
+        // One outbound packet per BaseApp connection is expected to fail here, and it is
+        // not a fault: it is the client's `baseAppLogin` request, sent before the
+        // connection has a session key at all, so there is nothing yet to decrypt it
+        // with. Its reply is what delivers the key (see
+        // [`wgtk::app::base::element::BaseAppLoginReply`]), and every packet after that
+        // decrypts normally.
+        //
+        // Logged at DEBUG rather than ERROR so it stops reading as a defect. Anything
+        // failing *after* that reply has been seen is a genuine problem and keeps ERROR.
+        let addr = peer.addr();
+        if self.base_login_seen.contains(&addr) {
+            error!(%addr, "Failed to decrypt a packet: ({direction:?})");
+        } else {
+            debug!(%addr, "Could not decrypt the pre-login packet ({direction:?}): \
+                expected, the session key does not exist yet");
+        }
         Ok(())
     }
 
@@ -1695,11 +1710,9 @@ impl BaseHandler {
                 return Ok(true);
             }
             SelectAliasedEntity::ID => {
-                // `ServerConnection::selectAliasedEntity`: `selectedEntityID_ = idAlias_[args.idAlias]`.
-                // The element is a `DebugElementFixed<_, 1>`, so its single data byte *is*
-                // the alias. Unresolvable alias clears the selection, as in `trace_dbg_alias`.
+                // Unresolvable alias clears the selection, as in `trace_dbg_alias`.
                 let e = elt.read_simple::<SelectAliasedEntity>()?;
-                let id_alias = e.element.data[0];
+                let id_alias = e.element.id_alias;
                 let entity_id = self.id_aliases.get(&id_alias).copied();
                 if entity_id.is_none() && self.warned_aliases.insert((SelectAliasedEntity::ID, id_alias)) {
                     let mut known: Vec<u8> = self.id_aliases.keys().copied().collect();
