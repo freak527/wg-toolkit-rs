@@ -235,7 +235,95 @@ impl SimpleElement for AckPhysicsCorrection {
     const LEN: ElementLength = ElementLength::ZERO;
 }
 
-pub type RequestEntityUpdate = DebugElementVariable16<{ id::REQUEST_ENTITY_UPDATE }>;
+/// The reply to `BaseAppExtInterface::baseAppLogin`: this connection's `SessionKey`.
+///
+/// Not an element -- it has no id of its own, since a reply is addressed by the request
+/// id it answers -- so it is a bare [`SimpleCodec`] read straight off the reply body.
+///
+/// `LoginHandler::onBaseAppLoginSuccess` calls it "the session key that authenticate
+/// message should send", and that is exactly what happens on the wire: the client echoes
+/// this value as [`SessionKey`] at the head of every subsequent outbound bundle.
+/// Confirmed over a full session -- all four replies decoded little-endian matched a
+/// session key the client then sent, byte for byte, and nothing else did.
+///
+/// The request itself is never readable by a proxy: it is the first thing the client
+/// sends on a fresh BaseApp connection, before the key that would let the proxy decrypt
+/// that packet exists. So this reply cannot be identified by pairing it with its
+/// request; see the caller for how it is recognised instead.
+#[derive(Debug, Clone, Copy)]
+pub struct BaseAppLoginReply {
+    pub session_key: u32,
+}
+
+impl SimpleCodec for BaseAppLoginReply {
+    fn write(&self, write: &mut dyn Write) -> io::Result<()> {
+        write.write_all(&self.session_key.to_le_bytes())
+    }
+    fn read(read: &mut dyn Read) -> io::Result<Self> {
+        let mut buf = [0u8; 4];
+        read.read_exact(&mut buf)?;
+        Ok(Self { session_key: u32::from_le_bytes(buf) })
+    }
+}
+
+/// Asks the server to re-send an entity's properties, naming the cache event stamps the
+/// client already holds so the server can send only what changed.
+///
+/// `ServerConnection::requestEntityUpdate` writes the id and then streams the stamps with
+/// no count and no terminator -- the element's own length is the only bound, so the stamp
+/// count is `(len - 4) / 4`. `CacheStamps` is `vector<EventNumber>` and `EventNumber` is
+/// `int32` (`network/basictypes.hpp`), hence signed.
+///
+/// An empty `stamps` is normal and meaningful: `ServerConnection` calls this with no
+/// stamps when it holds no cached state for the entity, which asks for everything.
+#[derive(Debug, Clone)]
+pub struct RequestEntityUpdate {
+    pub entity_id: u32,
+    pub stamps: Vec<i32>,
+    /// Bytes after the last whole stamp. Always empty if the layout above is right.
+    ///
+    /// Kept rather than raised as an error because this shape comes from the vanilla SDK
+    /// and has not been confirmed against WoT's build: erroring here would stop the whole
+    /// bundle on a guess, whereas a non-empty `rest` reports the mismatch and leaves
+    /// everything after it readable.
+    pub rest: Vec<u8>,
+}
+
+impl SimpleCodec for RequestEntityUpdate {
+
+    fn write(&self, write: &mut dyn Write) -> io::Result<()> {
+        write.write_all(&self.entity_id.to_le_bytes())?;
+        for stamp in &self.stamps {
+            write.write_all(&stamp.to_le_bytes())?;
+        }
+        write.write_all(&self.rest)
+    }
+
+    fn read(read: &mut dyn Read) -> io::Result<Self> {
+        let mut body = Vec::new();
+        read.read_to_end(&mut body)?;
+        if body.len() < 4 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("requestEntityUpdate: {} bytes, need at least the entity id", body.len())));
+        }
+        let entity_id = u32::from_le_bytes(body[..4].try_into().unwrap());
+        let tail = &body[4..];
+        let whole = tail.len() / 4 * 4;
+        Ok(Self {
+            entity_id,
+            stamps: tail[..whole].chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+            rest: tail[whole..].to_vec(),
+        })
+    }
+
+}
+
+impl SimpleElement for RequestEntityUpdate {
+    const ID: u8 = id::REQUEST_ENTITY_UPDATE;
+    const LEN: ElementLength = ElementLength::Variable16;
+}
 
 // =============================================================================
 // Network Replication Layer ("NRL"), WoT-specific -- see `client::element`'s own
@@ -250,11 +338,24 @@ pub type RequestEntityUpdate = DebugElementVariable16<{ id::REQUEST_ENTITY_UPDAT
 /// element differs. What travels this way is the `ServerMethodCallerNode` side of the
 /// tree (the client invoking a dynamic component's server method) plus node lookups.
 ///
-/// The framing is inferred from the inbound direction rather than confirmed against a
-/// capture, because the proxy only dumps inbound packets. [`NrlStream::rest`] is the
-/// check: it is empty when every record framed, and holds the bytes from the first
-/// record that didn't otherwise -- a consistently non-empty `rest` would mean this
-/// direction is *not* the same stream after all.
+/// Confirmed live: a battle's 120 elements all framed as exactly one message,
+/// `[type 6 (update node)][node id 1]`, with four bytes left in [`NrlStream::rest`].
+///
+/// Those four bytes are *not* a framing failure, which is what a non-empty `rest` meant
+/// when this was first written. A type-6 record is terminal precisely because its body
+/// is the node's new value, encoded per the owning component's own schema -- so `rest`
+/// holding it is the documented outcome, the same one the inbound direction reaches.
+///
+/// Measured over 769 consecutive samples from one battle, node 1's value is a
+/// little-endian `u32` **server tick**: every message increments it by exactly one, with
+/// no gaps and no repeats, at a measured 10.0 Hz against wall clock -- BigWorld's default
+/// `updateHertz`. So the client echoes the server's current tick back to the cell once
+/// per tick, which makes this a clock acknowledgement, not component data.
+///
+/// It is the server's clock, not the client's: its magnitude (~1.4e6, i.e. ~39 hours at
+/// 10 Hz) tracks server uptime and is unrelated to how long the client has been running,
+/// so it neither starts at zero on connect nor resets when the client does. Treat a
+/// discontinuity here as the server side restarting, never the local session.
 #[derive(Debug, Clone)]
 pub struct NrlMsgToCell(pub NrlStream);
 
@@ -465,6 +566,37 @@ mod tests {
 
     use super::*;
     use crate::app::client::element::NrlBody;
+
+    /// `requestEntityUpdate` streams its stamps with no count: the element length is the
+    /// only bound, so the stamp count is `(len - 4) / 4`.
+    #[test]
+    fn request_entity_update_reads_stamps_to_the_end() {
+
+        // entity 0x01020304, then three int32 stamps (the last negative, since
+        // `EventNumber` is signed).
+        let data = [
+            0x04, 0x03, 0x02, 0x01,
+            0x0a, 0x00, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0x7f,
+            0xff, 0xff, 0xff, 0xff,
+        ];
+        let r = <RequestEntityUpdate as SimpleCodec>::read(&mut &data[..]).unwrap();
+
+        assert_eq!(r.entity_id, 0x01020304);
+        assert_eq!(r.stamps, [10, i32::MAX, -1]);
+        assert!(r.rest.is_empty(), "rest: {:?}", r.rest);
+
+        // No stamps at all is legal: it asks for the entity's whole state.
+        let bare = <RequestEntityUpdate as SimpleCodec>::read(&mut &data[..4]).unwrap();
+        assert_eq!(bare.entity_id, 0x01020304);
+        assert!(bare.stamps.is_empty() && bare.rest.is_empty());
+
+        // A partial trailing stamp is reported, not silently dropped and not an error.
+        let ragged = <RequestEntityUpdate as SimpleCodec>::read(&mut &data[..10]).unwrap();
+        assert_eq!(ragged.stamps, [10]);
+        assert_eq!(ragged.rest, [0xff, 0xff]);
+
+    }
 
     /// [`NrlMsgToCell`] frames the generic `[type][node id][body]` stream, with no
     /// implied leading type -- the one assumption this direction rests on.

@@ -20,7 +20,7 @@ use wgtk::app::{proxy, login_proxy, base, client};
 use wgtk::app::dispatch::{ScriptDispatch, MethodCall, MethodDef, PropertyDef};
 use wgtk::app::math::{PackedXyz, PackedXz, calculate_reference_position};
 use glam::Vec3;
-use wgtk::app::base::element::CellMethodTables;
+use wgtk::app::base::element::{CellMethodTables, BaseAppLoginReply};
 use wgtk::net::packet::Packet;
 use wgtk::script::{Script, Value};
 
@@ -245,6 +245,7 @@ pub fn run(
         census_in: HashMap::new(),
         census_out: HashMap::new(),
         census_pending: 0,
+        base_login_seen: HashSet::new(),
     };
 
     thread::scope(move |scope| {
@@ -549,6 +550,14 @@ struct BaseHandler {
     census_in: HashMap<u8, u32>,
     census_out: HashMap<u8, u32>,
     census_pending: u32,
+    /// BaseApp peers whose `baseAppLogin` reply has already been seen.
+    ///
+    /// `baseAppLogin` is the first request a client makes on a fresh connection, so its
+    /// reply is the first reply that connection carries. That ordering is what identifies
+    /// it -- the request is sent before the proxy has the key to decrypt that packet, so
+    /// pairing by request id is impossible. See
+    /// [`wgtk::app::base::element::BaseAppLoginReply`].
+    base_login_seen: HashSet<SocketAddr>,
 }
 
 #[derive(Debug)]
@@ -723,8 +732,8 @@ impl BaseHandler {
     ///
     /// Reported periodically rather than at exit because the proxy has no shutdown hook,
     /// so the last report before you stop it is the session's census. The interval is
-    /// coarse on purpose: a battle pushes ~600 elements/second, so anything finer buries
-    /// the decode warnings this log exists for.
+    /// sized to report several times per battle, which is frequent enough to watch a
+    /// session progress without burying the decode warnings this log exists for.
     fn count_element(&mut self, outbound: bool, id: u8) {
 
         {
@@ -733,7 +742,7 @@ impl BaseHandler {
         }
 
         self.census_pending += 1;
-        if self.census_pending >= 50_000 {
+        if self.census_pending >= 10_000 {
             self.census_pending = 0;
             let fmt = |census: &HashMap<u8, u32>| {
                 let mut counts: Vec<(u32, u8)> =
@@ -988,18 +997,28 @@ impl BaseHandler {
                 return Ok(true);
             }
             AckPhysicsCorrection::ID => return trace_dbg!(elt, addr, AckPhysicsCorrection),
-            RequestEntityUpdate::ID => return trace_dbg!(elt, addr, RequestEntityUpdate),
+            RequestEntityUpdate::ID => {
+                // At INFO while the layout is on probation: it comes from the vanilla
+                // SDK and has not been confirmed against WoT's build. `rest` is the
+                // check -- empty across a session means the stamp list really is bare
+                // `int32`s to the end of the element. Drop to `trace_dbg!` once it holds.
+                let e = elt.read_simple::<RequestEntityUpdate>()?;
+                let r = &e.element;
+                info!(%addr, id = RequestEntityUpdate::ID, rest = %hex(&r.rest),
+                    "-> Request entity update: ({}) stamps={:?}", r.entity_id, r.stamps);
+                return Ok(true);
+            }
             NrlMsgToCell::ID => {
-                // At INFO, unlike the other `Nrl*` elements, because this direction's
-                // framing is inferred from the inbound stream rather than confirmed
-                // against a capture (the proxy dumps inbound packets only). `rest` is the
-                // verdict: empty across a session means the client -> cell direction
-                // really is the same `BWEndPoint` stream. Drop this back to `trace_dbg!`
-                // once that holds.
+                // At INFO, unlike the other `Nrl*` elements: the framing is confirmed
+                // (see `NrlMsgToCell`) but the trailing value is not, so `rest` goes out
+                // as hex rather than a length. Every sample so far is the same four bytes
+                // wide on node 1 at ~10Hz, which is the shape of one periodic scalar --
+                // the hex is what lets that be identified. Drop this to `trace_dbg!` once
+                // the component schema resolves it.
                 let e = elt.read_simple::<NrlMsgToCell>()?;
                 let NrlMsgToCell(stream) = &e.element;
                 info!(%addr, id = NrlMsgToCell::ID, messages = stream.messages.len(),
-                    rest = stream.rest.len(),
+                    rest = %hex(&stream.rest),
                     "-> Nrl msg to cell: {:?}", stream.messages);
                 return Ok(true);
             }
@@ -1101,9 +1120,25 @@ impl BaseHandler {
                     //
                     // Both sides log their request id, so pairing a reply with the request
                     // it answers is a join over the trace, not state to keep here.
+                    let addr = peer.addr();
                     let request_id = reply.request_id();
                     let body = reply.read_simple::<DebugElementVariable32<REPLY_ID>>()?;
-                    info!(addr = %peer.addr(), request_id, "<- Reply (undecoded): {body:?}");
+
+                    // Read as raw bytes first, then typed: a reply carries no element id,
+                    // so nothing in it says what shape it is. The one shape known so far
+                    // is `baseAppLogin`'s, recognised by position rather than content --
+                    // first reply on a connection, four bytes long. Guarding on both
+                    // keeps a later four-byte reply to some *other* request from being
+                    // mislabelled a session key.
+                    let first_on_peer = self.base_login_seen.insert(addr);
+                    match <[u8; 4]>::try_from(&body.data[..]) {
+                        Ok(bytes) if first_on_peer => {
+                            let reply = BaseAppLoginReply { session_key: u32::from_le_bytes(bytes) };
+                            info!(%addr, request_id,
+                                "<- Base app login reply: session key 0x{:08X}", reply.session_key);
+                        }
+                        _ => info!(%addr, request_id, "<- Reply (undecoded): {body:?}"),
+                    }
                 }
             }
         }
