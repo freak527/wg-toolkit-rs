@@ -281,13 +281,11 @@ impl App {
                     self.peers.remove(&addr).unwrap();
                 }
                 // A handler-supplied `real_addr` that the OS rejects outright (e.g. port
-                // 0, confirmed live from a patched-in address built off a desynced/corrupt
-                // upstream element) must not be allowed to propagate: unlike
-                // `ConnectionReset`, this doesn't self-resolve by dropping the peer's
-                // *socket*, but the peer itself is unsalvageable either way, and letting
-                // it bubble out of `poll` kills `run`'s loop for every other connected
-                // peer too, not just this one -- confirmed live to take down the whole
-                // base app. Drop just this peer and keep serving everyone else.
+                // 0, from an address patched in off a desynced upstream element) must not
+                // propagate. Unlike `ConnectionReset` it does not resolve by dropping the
+                // peer's socket, and the peer is unsalvageable either way, but letting it
+                // bubble out of `poll` ends `run`'s loop for every other connected peer
+                // too. Drop just this peer and keep serving everyone else.
                 Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
                     warn!("Dropped peer due to an invalid destination address ({:?}): {addr}", match direction {
                         PacketDirection::Out => peer.real_addr,

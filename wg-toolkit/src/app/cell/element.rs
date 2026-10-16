@@ -9,19 +9,16 @@ use crate::net::element::{DebugElementFixed, DebugElementVariable16};
 
 /// Internal module containing all raw elements numerical ids.
 ///
-/// All ids below were confirmed empirically by attaching to a live game process
-/// (v2.3.1.3, 2026-08-24) and reading the actual registration order out of
-/// `CellAppInterface`'s `Mercury::InterfaceMinder` in memory, directly from
-/// `WorldOfTanks.exe` (the client binary). Only 8 elements were registered on the
-/// client build — unlike `BaseAppExtInterface`/`ClientInterface` (which each use the
+/// The ids follow the registration order of `CellAppInterface`'s
+/// `Mercury::InterfaceMinder` in the client. Only 8 elements are registered there,
+/// unlike `BaseAppExtInterface`/`ClientInterface` (which each use the
 /// full 0x00..0xFE id space, including a big exposed-method/property range), this
 /// `CellAppInterface` instance never had `addRange` called on it, so `runExposedMethod`
 /// (id 7) is a single anchor id, not the start of a range, at least as registered by
 /// the client binary.
 pub mod id {
-    // Length style/param re-confirmed via a fresh re-run of
-    // `re-work/frida/dump_interfaces.js` (2026-08-31) -- no `CALLBACK` ids in this
-    // interface either, same as `base::element`'s `BaseAppExtInterface`.
+    // No `CALLBACK` ids in this interface, same as `base::element`'s
+    // `BaseAppExtInterface`.
 
     // --- Cell session handshake ---
     pub const CELL_APP_LOGIN: u8           = 0x00;  // VAR 2

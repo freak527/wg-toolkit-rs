@@ -4,7 +4,7 @@ WoT's server side is a cluster of specialized processes (BigWorld calls them "ap
 each with their own `Mercury::InterfaceMinder`-based message interface. `wg-toolkit`
 only needs to speak the interfaces a real *client* actually touches directly.
 
-## LoginApp (`net/app/login/`)
+## LoginApp (`app/login/`)
 
 The first server the client talks to. Handles authentication (`login`) and returns
 either an error or the address of a `BaseApp` to connect to next, plus a login key
@@ -12,7 +12,7 @@ used to authenticate that follow-up connection. Deliberately tiny/stateless prot
 (`login`, `probe`, `ping`, `challengeResponse`, `mtuProbe`) — it doesn't know about
 entities, spaces, or anything gameplay-related.
 
-## BaseApp (`net/app/base/`, server→client half in `net/app/client/`)
+## BaseApp (`app/base/`, server→client half in `app/client/`)
 
 The app the client stays connected to for the whole session, independent of whatever
 "space" (hangar, battle arena, ...) the player is currently in. Owns the *base* half
@@ -20,7 +20,7 @@ of the player's entity (`Account`, persistent state, chat, inventory/tech-tree s
 RPCs like `CMD_SYNC_DATA`), streams resources to the client (`ResourceHeader`/
 `ResourceFragment`), and can hand the client off to a different `BaseApp` instance for
 load-balancing or failover (`SwitchBaseApp` — the client fully disconnects and
-reconnects to the new address, confirmed live).
+reconnects to the new address).
 
 `BaseAppExtInterface` (the "Ext" meaning client-facing, as opposed to an internal,
 server-to-server interface this project has no reason to implement) is what
@@ -29,7 +29,7 @@ server-to-server interface this project has no reason to implement) is what
 `nrlMsgToCell`, and the base app relays the cell's replies back down to the client —
 *unless* the client has been hand-shaked into a direct connection (see below).
 
-## CellApp (`net/app/cell/`, ids only so far, no socket-server implementation yet)
+## CellApp (`app/cell/`, ids only, no socket-server implementation)
 
 Owns the *cell* half of the entity: position, orientation, physics, and everything
 spatially scoped to one "space" — this is what actually runs the hangar and each

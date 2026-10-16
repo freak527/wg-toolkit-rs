@@ -113,7 +113,7 @@ pub mod id {
     pub const AVATAR_UPDATE_NO_ALIAS_NO_POS_YAW_PITCH: u8               = 0x32;  // CALLBACK, Fixed(7)
     pub const AVATAR_UPDATE_NO_ALIAS_NO_POS_YAW: u8                     = 0x33;  // CALLBACK, Fixed(6)
     pub const AVATAR_UPDATE_NO_ALIAS_NO_POS_NO_DIR: u8                  = 0x34;  // CALLBACK, Fixed(5)
-    pub const AVATAR_UPDATE_ALIAS_FULL_POS_YAW_PITCH_ROLL: u8           = 0x35;  // CALLBACK, Fixed(12) (originally found via live capture, now cross-confirmed via disassembly)
+    pub const AVATAR_UPDATE_ALIAS_FULL_POS_YAW_PITCH_ROLL: u8           = 0x35;  // CALLBACK, Fixed(12)
     pub const AVATAR_UPDATE_ALIAS_FULL_POS_YAW_PITCH: u8                = 0x36;  // CALLBACK, Fixed(10)
     pub const AVATAR_UPDATE_ALIAS_FULL_POS_YAW: u8                      = 0x37;  // CALLBACK, Fixed(9)
     pub const AVATAR_UPDATE_ALIAS_FULL_POS_NO_DIR: u8                   = 0x38;  // CALLBACK, Fixed(8)
@@ -248,13 +248,10 @@ impl SimpleElement for ResetEntities {
 /// entity share one id, `lib/network/basictypes.hpp`), so `base::App::create_cell_player`
 /// takes the existing base [`Handle`](super::super::base::Handle) instead of minting one.
 ///
-/// CONFIRMED against a live capture by disassembling this project's actual target (WoT
-/// v2.3.1.3)'s own `ServerConnection::createCellPlayer` handler (found via the live
-/// `ClientInterface` message table, `re-work/frida/dump_cellplayer_handler*.js`): this
-/// fork's wire layout is NOT a plain byte-for-byte match for vanilla 14.4.1's `stream >>
-/// spaceID_ >> vehicleID >> pos >> packedXZScale_ >> dir` (same as [`CreateBasePlayer`]
-/// needing extra fields vanilla doesn't have) -- it inserts a leading byte and widens the
-/// space between `space_id` and `vehicle_id` by a 2-byte field. `packed_xz_scale` is
+/// The layout follows the client's own `ServerConnection::createCellPlayer` handler, and
+/// is not a byte-for-byte match for vanilla 14.4.1's `stream >> spaceID_ >> vehicleID >>
+/// pos >> packedXZScale_ >> dir`: like [`CreateBasePlayer`], WoT adds fields. It inserts
+/// a leading byte and a 2-byte field between `space_id` and `vehicle_id`. `packed_xz_scale` is
 /// constant per server configuration, identical across battles.
 ///
 /// `direction` is assumed to be 3 raw `f32`s (yaw/pitch/roll, BigWorld's conventional
@@ -265,18 +262,17 @@ impl SimpleElement for ResetEntities {
 /// carried as a raw pre-encoded blob (`cell_data`) the caller must build.
 #[derive(Debug, Clone)]
 pub struct CreateCellPlayer {
-    /// Always `0` in every capture seen so far -- meaning unconfirmed.
+    /// Always `0` in observed traffic; meaning unknown.
     pub unk_flag: u8,
     /// The id of the space this entity now lives in.
     pub space_id: u32,
-    /// Always `0` in every capture seen so far -- meaning unconfirmed.
+    /// Always `0` in observed traffic; meaning unknown.
     pub unk_short: u16,
-    /// CONFIRMED live (WoT v2.3.1.3, actual battle capture): the id of a distinct
-    /// `Vehicle` entity, not the player's own base/`Account` entity -- a later
-    /// `SelectEntity` targets this same id for the vehicle's own property/method
-    /// updates (see `wg-toolkit-cli`'s proxy `CreateCellPlayer` handling, which
-    /// registers it). Empirically the exact same value also appears again inside
-    /// `cell_data` right after a constant marker byte.
+    /// The id of a distinct `Vehicle` entity, not the player's own base entity. A later
+    /// `SelectEntity` targets this id for the vehicle's own property and method updates
+    /// (see `wg-toolkit-cli`'s proxy `CreateCellPlayer` handling, which registers it).
+    /// The same value appears again inside `cell_data`, right after a constant marker
+    /// byte.
     pub vehicle_id: u32,
     pub position: Vec3,
     /// The server's packed-XZ compression scale, needed by the client to decode any
@@ -345,19 +341,15 @@ pub struct CreateBasePlayer<'a> {
     /// The actual data sent for creating the player's entity -- borrowed when writing
     /// (the caller already owns it), owned when read off the wire.
     pub entity_data: Cow<'a, Value>,
-    /// The number of *dynamic* components attached to this specific entity instance --
-    /// confirmed against `wg-toolkit-cli/src/bootstrap/mod.rs`'s own extension-parsing
-    /// comments: WoT's "StaticComponents" (declared per `extension.xml`) fold their
-    /// methods/properties into every instance's own method table at codegen time, so
-    /// they need no runtime handling at all and aren't counted here. "DynamicComponents"
-    /// are instead attached to individual entity instances at runtime (e.g. only for the
-    /// duration of a particular battle mode), don't claim a fixed exposed id, and are
-    /// what this count refers to.
+    /// The number of *dynamic* components attached to this specific entity instance.
+    /// WoT's static components fold their methods and properties into the entity's own
+    /// tables, so they need no runtime handling and are not counted here. Dynamic
+    /// components are attached to individual instances at runtime (e.g. for one battle
+    /// mode) and claim no fixed exposed id.
     ///
-    /// TODO: no live capture with a nonzero count has been analyzed yet, so the actual
-    /// per-component wire encoding that would follow (id/name + its own data) isn't
-    /// confirmed -- this field is read/written verbatim (round-trips correctly even at
-    /// 0, the only value seen so far) but the components themselves aren't decoded.
+    /// Nonzero counts are normal (an `Account` carries 19), yet no component data follows
+    /// the count: the element ends right after it. The components themselves are
+    /// replicated separately, over the NRL protocol (see the `Nrl*` elements).
     pub entity_components_count: u8,
 }
 
@@ -379,13 +371,15 @@ impl CreateBasePlayer<'_> {
     fn read_suffix(read: &mut dyn Read, entity_id: u32, entity_type_id: u16, data_ty: &Ty) -> io::Result<Self> {
         let entity_data = Value::read(read, data_ty)?;
         let entity_components_count = read.read_u8()?;
-        // Diagnostic: dump whatever trailing bytes follow a nonzero count, which is the
-        // only way to learn the per-component wire encoding -- see this struct's
-        // `entity_components_count` doc comment.
+        // Nothing follows a nonzero count (see `entity_components_count`), so leftover
+        // bytes would mean the layout above does not fit this payload.
         if entity_components_count != 0 {
             let mut trailer = Vec::new();
             read.read_to_end(&mut trailer)?;
-            warn!("CreateBasePlayer: entity_id={entity_id} entity_components_count={entity_components_count}, trailing bytes: {trailer:?}");
+            if !trailer.is_empty() {
+                warn!("CreateBasePlayer: entity_id={entity_id} entity_components_count={entity_components_count}, \
+                    {} unexpected trailing bytes: {trailer:?}", trailer.len());
+            }
             return Ok(Self {
                 entity_id,
                 entity_type_id,
@@ -573,7 +567,7 @@ pub type RemoveSpaceGeometryMapping = DebugElementVariable16<{ id::REMOVE_SPACE_
 pub struct CreateEntity {
     pub entity_id: u32,
     pub entity_type_id: u16,
-    /// Always `0` in every capture seen so far -- meaning unconfirmed (possibly a
+    /// Always `0` in observed traffic; meaning unknown (possibly a
     /// component/variant index, always 0 for a plain entity with no dynamic component
     /// attached at creation time). See [`Self::resource_name`] and this struct's own
     /// doc comment for how this was found.
@@ -1276,8 +1270,8 @@ pub type ChangeVolatilePackerType = DebugElementVariable16<{ id::CHANGE_VOLATILE
 //
 // Everything is a node in one tree mirroring entity -> dynamic component ->
 // property/method, and every message addresses a node by a 16-bit id. The shapes below
-// come from the v2.4.0.0 client (`BWEndPoint`, `Hub::processMessage`,
-// `ClientNodeFactory::create`) and are validated against real captures.
+// follow the client's `BWEndPoint`, `Hub::processMessage` and
+// `ClientNodeFactory::create`.
 // =============================================================================
 
 /// One node kind in the NRL tree, as `ClientNodeFactory::create` instantiates them
@@ -1814,7 +1808,7 @@ impl SimpleElement for NrlUpdateNodeFlag {
 /// The decoded body of an [`NrlUnreliableMsgToClient`], keyed off its `kind` byte.
 #[derive(Debug, Clone)]
 pub enum NrlUnreliableMsgToClientPayload {
-    /// The one shape decoded so far (`kind` `0x30`): 9 constant bytes of unknown
+    /// The one decoded shape (`kind` `0x30`): 9 constant bytes of unknown
     /// meaning, 7 little-endian `f32`s, then 2 more constant bytes. **None of the 7
     /// floats' meaning is confirmed.** `floats[3..6]` looked like a raw position at
     /// first (plausible in-map values), but its norm stays a constant `~792.0` across
@@ -1827,8 +1821,8 @@ pub enum NrlUnreliableMsgToClientPayload {
         floats: [f32; 7],
         unk_suffix: [u8; 2],
     },
-    /// Any other `(kind, payload)` shape -- only the 8-byte `kind=0x11` shape seen
-    /// live so far, not decoded.
+    /// Any other `(kind, payload)` shape, such as the 8-byte `kind=0x11` one, not
+    /// decoded.
     Raw(Vec<u8>),
 }
 
@@ -3266,13 +3260,10 @@ mod tests {
 
     }
 
-    /// The same slice, decoded against the entity's *tracked* value instead of by guessing.
+    /// The same slice, decoded against the entity's *tracked* value.
     ///
-    /// An `Array`'s live length decides how many bits its index and range fields occupy,
-    /// so without it the decoder tries every length and keeps each self-consistent parse --
-    /// several of which can survive (measured live: of 46 slice updates in one battle, 9
-    /// were ambiguous outright and 9 more rested on the append tie-break). Given the real
-    /// length there is exactly one reading, and nothing is inferred.
+    /// An `Array`'s live length decides how many bits its index and range fields occupy.
+    /// Given the real length there is exactly one reading, and nothing is inferred.
     #[test]
     fn slice_array_range_with_tracked_length() {
 

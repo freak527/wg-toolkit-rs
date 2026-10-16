@@ -30,14 +30,12 @@ use super::bit::{BitReader, BitWriter};
 /// values are 3/8/8/4/11; WG recompiled with different ones, which is why the packed
 /// fields on the wire are wider than the stock engine's.
 ///
-/// Recovered from `WorldOfTanks.exe` 2.4.0.0 by reading the inlined `unpackFloat`
-/// bodies: each `BitReader::get(n)` call passes `n` in `edx`, and the mantissa's
-/// `shl` immediate is `23 - MANTISSA_BITS`, so both halves of every field are stated
-/// twice and cross-check. Two independent inlinings of each of `unpackXYZ`
-/// (`0x140e369d0`, `0x140e54b10`) and `unpackXZ` (`0x140e36e60`, `0x140e54fa0`) agree.
-/// The resulting totals -- 48 bits for `PackedXyz`, 24 for `PackedXz` -- are exact
-/// multiples of 8, as `msgtypes.hpp`'s `#error Unused bits in ...` guards require, and
-/// match the 6- and 3-byte wire widths already confirmed against the live client.
+/// The values come from the client's inlined `unpackXYZ`/`unpackXZ`: each
+/// `BitReader::get(n)` call states a field's bit count, and the mantissa's `shl`
+/// immediate is `23 - MANTISSA_BITS`, so every field is stated twice and can be checked.
+/// A new client build can change them; that is where to look. The totals, 48 bits for
+/// `PackedXyz` and 24 for `PackedXz`, are exact multiples of 8 as `msgtypes.hpp`'s
+/// `#error Unused bits in ...` guards require, and match the 6- and 3-byte wire widths.
 ///
 /// Note `EXPONENT_BITS_XZ` is one macro shared by [`PackedXyz`] and [`PackedXz`], and
 /// the binary does use 4 in both -- an independent consistency check on the reading.
@@ -148,10 +146,9 @@ fn i8_to_half_angle(compressed: i8) -> f32 {
 /// elements.
 ///
 /// Each component is sign + exponent + mantissa, so the field is
-/// `(1+4+12)*2 + (1+4+9)` = 48 bits = 6 bytes, matching the wire width confirmed
-/// against the live client. The bit counts come from the client binary -- see
-/// [`EXPONENT_BITS_XZ`] for how they were recovered. The stock engine's 3/8/4/11 split
-/// would be 40 bits = 5 bytes, which is why this used to decode to garbage.
+/// `(1+4+12)*2 + (1+4+9)` = 48 bits = 6 bytes, the wire width. The bit counts come from
+/// the client binary; see [`EXPONENT_BITS_XZ`]. The stock engine's 3/8/4/11 split would
+/// be 40 bits = 5 bytes, so decoding with vanilla values yields garbage.
 ///
 /// `CreateEntity` doesn't use this compressed form -- its own position is a plain
 /// unpacked [`Vec3`].
@@ -382,9 +379,8 @@ mod tests {
         assert!((z - (-56.78)).abs() < 0.05);
     }
 
-    /// The bit allocation recovered from the client must exactly fill the wire widths
-    /// that were independently confirmed against the live client (6 bytes for
-    /// `PackedXyz`, 3 for `PackedXz`). `msgtypes.hpp` enforces this at compile time with
+    /// The bit allocation must exactly fill the wire widths (6 bytes for `PackedXyz`, 3
+    /// for `PackedXz`). `msgtypes.hpp` enforces this at compile time with
     /// `#error Unused bits in ... position update`, so a split that leaves slack -- as
     /// the vanilla 3/8/4/11 one did, summing to 40 bits rather than 48 -- is wrong by
     /// construction, whatever else it decodes to.

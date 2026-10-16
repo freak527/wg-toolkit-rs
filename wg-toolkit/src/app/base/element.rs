@@ -135,10 +135,8 @@ impl SimpleElement for DisconnectClient {
 }
 
 
-// The following elements are known (id, length style, length param all confirmed
-// live against v2.3.1.3) but not yet given a proper structured codec, so they are
-// defined as raw/debug elements for now, following the same convention used for
-// elements not yet fully reverse-engineered in `client::element`.
+// The following elements have a known id and framing but no structured codec, so they
+// are defined as placeholder elements, the same convention as in `client::element`.
 
 // =============================================================================
 // Avatar updates & physics corrections
@@ -148,19 +146,16 @@ impl SimpleElement for DisconnectClient {
 /// server/periphery selection.
 pub type PingDatacenter = DebugElementFixed<{ id::PING_DATACENTER }, 10>;
 
-// Both messages below are confirmed against the leaked BigWorld 14.4.1 SDK
-// (`connection/baseapp_ext_interface.hpp`'s `BaseAppExtInterface::avatarUpdateImplicit`/
-// `avatarUpdateExplicit`, specifically their `!VOLATILE_POSITIONS_ARE_ABSOLUTE` variant
-// -- confirmed still in effect for this build, see `network/msgtypes.hpp`), but each
-// comes out exactly 1 byte short of the length used here (16 vs
-// 17, 21 vs 22 -- both from live `BaseAppExtInterface` registration data, see the `id`
-// module). The same +1 discrepancy shows up independently in every other
-// `avatarUpdate*`-family message checked so far (all three client-directed `*Detailed`
-// messages in `client::element`), which is consistent enough to suspect a single,
-// uniform addition across the whole family rather than a one-off -- but its exact
-// position and meaning aren't confirmed here, so it's kept as a raw trailing
-// `unk_byte: u8` (trailing is a guess, not confirmed placement) rather than asserted as
-// a specific field.
+// Both messages below follow `BaseAppExtInterface::avatarUpdateImplicit`/
+// `avatarUpdateExplicit` (`connection/baseapp_ext_interface.hpp`), in their
+// `!VOLATILE_POSITIONS_ARE_ABSOLUTE` variant (`network/msgtypes.hpp`), but each is one
+// byte longer than that layout: 17 bytes rather than 16, and 22 rather than 21. The
+// client-directed `*Detailed` messages in `client::element` carry the same extra byte.
+//
+// Its position and meaning are unknown, so it is kept as a trailing `unk_byte: u8`;
+// trailing is an assumption. The same extra byte follows the packed yaw/pitch/roll in
+// `CreateEntity` (`direction_unk`) and in the `*_YAW_PITCH_ROLL` avatar updates, so it
+// may belong to the direction rather than to the end of the message.
 crate::__struct_simple_codec! {
     /// Sent by the client to report an update to its own position/direction, without
     /// stating which vehicle it's on -- see [`AvatarUpdateExplicit`] for the version that
@@ -239,10 +234,12 @@ impl SimpleElement for AckPhysicsCorrection {
 /// The client echoes this value as [`SessionKey`] at the head of every subsequent
 /// outbound bundle, which is what authenticates the connection.
 ///
-/// A proxy cannot read the request that asks for it: `baseAppLogin` is the first thing
-/// the client sends on a fresh BaseApp connection, before the key that would decrypt
-/// that packet exists. The reply therefore cannot be matched to its request by id, and
-/// the caller identifies it by position instead.
+/// The request that asks for it, `baseAppLogin`, is the one packet on a BaseApp
+/// connection that is not encrypted: `BaseAppLoginRequestProtocol::sendRequest` sends it
+/// off-channel and only then enables the channel's block cipher, to receive this reply.
+/// A reader that expects every packet to be encrypted fails on that request, so it has no
+/// request id to match the reply against and must identify the reply by position: the
+/// first reply on the connection.
 #[derive(Debug, Clone, Copy)]
 pub struct BaseAppLoginReply {
     pub session_key: u32,

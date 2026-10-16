@@ -6,13 +6,11 @@
 //! Pass a game dir, and optionally a file of hex payloads (one per line) to replace the
 //! built-in samples.
 //!
-//! # Reduced scope since the length guess was removed
+//! # Scope
 //!
-//! This tool was written when `decode_compressed_path` would brute-force an `Array`'s
-//! length, trying every value up to a cap and keeping each self-consistent parse. That
-//! guessing is gone: a path's bit layout depends on the *live* length of every `Array` it
-//! crosses, so the decoder now needs the entity's tracked property values and reports
-//! "no consistent decode" without them.
+//! A path's bit layout depends on the *live* length of every `Array` it crosses, so the
+//! decoder needs the entity's tracked property values and reports "no consistent decode"
+//! without them.
 //!
 //! This tool has no tracked values -- it only has tables -- so **any payload whose path
 //! crosses an `Array` is undecodable here**, and will simply score zero against every
@@ -57,11 +55,10 @@ fn main() {
     println!("{} tables to try ({} entities + {} dynamic components)",
         names.len(), dispatch.script.entities.len(), dispatch.script.dynamic_components.len());
 
-    // Fresh, healthy-stream capture (2026-09-10, zero `Unknown element` errors in the
-    // session): every one of these was preceded by `Select entity (not tracked)`, so the
-    // proxy had no dispatch table and could only log the raw payload.
+    // Captured payloads, each from an entity the proxy had no dispatch table for, so only
+    // the raw bytes were logged.
     let samples: &[(&str, &str)] = &[
-        // Previously ambiguous on real traffic.
+        // Payloads with more than one plausible reading.
         ("amb1 a0000100", "a0000100"),
         ("amb2 80003893", "80003893"),
         ("amb3 a0004600", "a0004600"),

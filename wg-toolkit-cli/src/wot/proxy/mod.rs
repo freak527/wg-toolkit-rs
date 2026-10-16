@@ -91,13 +91,6 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Read an element whose exact wire framing (length style) has been confirmed live
-/// against the real client (see `re-work/NOTES.md`) even though `wg-toolkit` doesn't
-/// yet understand what it means, so it can be read (and the bundle safely continued)
-/// as its already-defined placeholder type. Logged at `trace` level with structured
-/// `id`/`request_id` fields -- like every other event here, the same call feeds both
-/// the console (filtered by `RUST_LOG`) and the always-on `proxy-trace.jsonl` file
-/// (see `cmd_wot`), so there's no separate dump path to keep in sync.
 /// Append every inbound packet to `$WGTK_DUMP_PACKETS`, when set. Opened once, lazily;
 /// any I/O error disables the dump rather than disturbing the proxy.
 fn dump_packets(raw: &[String]) {
@@ -118,6 +111,13 @@ fn dump_packets(raw: &[String]) {
     }
 }
 
+/// Read an element as `$ty` and log it at TRACE, with structured `id`/`request_id`
+/// fields. Used for elements whose framing is known, so the bundle can continue past
+/// them, whatever their body decodes to.
+///
+/// Like every other event here, the same call feeds both the console (filtered by
+/// `RUST_LOG`) and the always-on `proxy-trace.jsonl` file (see `cmd_wot`), so there is no
+/// separate dump path to keep in sync.
 macro_rules! trace_dbg {
     ($elt:expr, $addr:expr, $ty:ty) => {{
         let e = $elt.read_simple::<$ty>()?;
@@ -130,11 +130,9 @@ macro_rules! trace_dbg {
 /// Like [`trace_dbg`], but for elements that still have no real codec: logs the body at
 /// INFO so samples accumulate in the session logs rather than vanishing at TRACE.
 ///
-/// Most of these have never been seen on the wire at all, and the ones that have appear
-/// one to three times a session -- far too sparse to work out a layout from a single
-/// capture, and easy to miss entirely if they only log at TRACE. Surfacing them means a
-/// corpus builds up across sessions for free, which is how `CreateEntity`'s alignment and
-/// the NRL tick were both cracked.
+/// These elements are rare, a few per session at most, so a layout has to be worked out
+/// from samples gathered over many sessions. Logging them at INFO keeps every sample in
+/// the session logs instead of losing it at TRACE.
 ///
 /// Capped per element id so that one of these turning out to be high-rate (several are
 /// named "periodic" or "heartbeat") cannot drown the log: past the cap it falls back to
@@ -163,11 +161,9 @@ macro_rules! sample_dbg {
 /// position update belongs to *that* entity, not to whatever `SelectEntity`/
 /// `SelectPlayerEntity` last named.
 ///
-/// Not tracking this is what made ~20k of one battle's property updates decode as the
-/// player `Avatar`'s `denunciationsLeft` (its index 13) when they were really each
-/// vehicle's `gunAnglesPacked` (`Vehicle`'s index 13) -- and likewise made `Vehicle`'s
-/// `avatarID` (index 16, an `OBJECT_ID`, hence the entity-id-looking values) read as
-/// `Avatar`'s `arenaTypeID`.
+/// Ignoring this attributes the following properties to the wrong entity without any
+/// decode error: index 13 is `Avatar`'s `denunciationsLeft` but `Vehicle`'s
+/// `gunAnglesPacked`, and both decode cleanly from the same bytes.
 macro_rules! trace_dbg_entity {
     ($self:expr, $elt:expr, $addr:expr, $ty:ty) => {{
         let e = $elt.read_simple::<$ty>()?;
@@ -502,26 +498,16 @@ struct BaseHandler {
     /// may use a merely-plausible type: currently `Nested`/`SliceEntityProperty`, both
     /// always `Variable16`.
     ///
-    /// `ENTITY_PROPERTY`/`ENTITY_METHOD` used to be excluded, since they derive the
-    /// element's wire length from the table (see `EntityMethod::read_length`, keyed off
-    /// `client_methods.len()`): a wrong type there mis-frames that element and everything
-    /// after it in the bundle, which can corrupt a downstream `SwitchBaseApp` into a
-    /// garbage address that this proxy would then adopt, killing the connection.
+    /// `CreateEntity`/`CreateEntityDetailed` carry the entity's declared
+    /// `entity_type_id`, as authoritative as the one `CreateBasePlayer` puts into
+    /// `entities`, so every decoder may use it, including `ENTITY_PROPERTY` and
+    /// `ENTITY_METHOD`. Those two derive the element's wire length from the table (see
+    /// `EntityMethod::read_length`), so a wrong type would mis-frame the rest of the
+    /// bundle; the type here is not a guess, which is what makes that safe.
     ///
-    /// That exclusion has been lifted, because the premise behind "merely-plausible" was
-    /// wrong: `CreateEntity`/`CreateEntityDetailed` carry the entity's *declared*
-    /// `entity_type_id`, which is exactly as authoritative as the one `CreateBasePlayer`
-    /// puts into `entities` -- it was only ever kept apart out of caution, not evidence.
-    /// Withholding it was costing real traffic: once AVUPMSG re-targeting landed (see
-    /// `trace_dbg_entity`), 2728 of one battle's property updates resolved to vehicles
-    /// known only from `CreateEntity` and were dropped here, at element ids that decode
-    /// against `Vehicle` as `gunAnglesPacked` (1966), `engineMode` (619), `isStrafing`
-    /// (143) and `avatarID` -- i.e. ordinary per-tick vehicle telemetry, all correctly
-    /// sized for that table.
-    ///
-    /// The `SwitchBaseApp` failure mode this once guarded against keeps its own, more
-    /// direct defences (the `0.x.x.x` / port-0 / `/16`-match checks in that arm), which
-    /// are what actually stopped it recurring.
+    /// A mis-framed bundle can corrupt a downstream `SwitchBaseApp` into a garbage
+    /// address. That arm has its own checks against it (the `0.x.x.x` / port-0 /
+    /// `/16`-match tests) rather than relying on framing always being right.
     created_entity_types: HashMap<u32, u16>,
     selected_entity_id: Option<u32>,
     player_entity_id: Option<u32>,
@@ -554,18 +540,14 @@ struct BaseHandler {
     /// The current value of every client-visible property this proxy has seen set, per
     /// entity.
     ///
-    /// Kept because a compressed property path is only decodable against the *live* length
-    /// of every `Array` it crosses: the length decides how many bits the index and range
-    /// fields occupy, so without it `decode_compressed_path` has to try every length and
-    /// keep whichever parses are self-consistent -- ambiguous whenever two lengths agree
-    /// on the bits. Before this was tracked, a battle's 46 slice updates split 28 exact /
-    /// 9 resolved only by a since-removed append guess / 9 ambiguous outright; with it,
-    /// and with creation-time seeding plus `updateEntity`, every slice decoded exactly.
+    /// A compressed property path is only decodable against the *live* length of every
+    /// `Array` it crosses: the length decides how many bits the index and range fields
+    /// occupy. Without a tracked value for an array, a path through it is reported as
+    /// undecodable rather than guessed at.
     ///
-    /// Seeded by whole-property updates (`ENTITY_PROPERTY`, e.g. `damageStickers=[]`
-    /// before a destructible is first hit) and then maintained by the nested/slice updates
-    /// themselves. A property never seen whole simply stays absent, and the decoder falls
-    /// back to guessing for it.
+    /// Seeded from each entity's creation payload (`CreateEntity::client_properties`),
+    /// from `updateEntity` runs, and from whole-property updates (`ENTITY_PROPERTY`), then
+    /// kept current by the nested and slice updates themselves.
     entity_properties: HashMap<u32, HashMap<Arc<str>, Value>>,
     /// How many times each element id was seen, inbound and outbound, and how many have
     /// been counted since the last report.
@@ -580,9 +562,9 @@ struct BaseHandler {
     /// BaseApp peers whose `baseAppLogin` reply has already been seen.
     ///
     /// `baseAppLogin` is the first request a client makes on a fresh connection, so its
-    /// reply is the first reply that connection carries. That ordering is what identifies
-    /// it -- the request is sent before the proxy has the key to decrypt that packet, so
-    /// pairing by request id is impossible. See
+    /// reply is the first reply that connection carries. That ordering is how the reply
+    /// is identified, because the request itself is sent unencrypted and fails
+    /// decryption here, leaving no request id to pair with. See
     /// [`wgtk::app::base::element::BaseAppLoginReply`].
     base_login_seen: HashSet<SocketAddr>,
     /// How many bodies have been surfaced at INFO per element id, for [`sample_dbg`]'s cap.
@@ -603,9 +585,9 @@ struct Shared {
     pending_clients: Mutex<HashMap<SocketAddr, PendingClient>>,
     /// Same idea as `pending_clients`, but keyed by IP only: after a SwitchBaseApp, the
     /// client tears down its whole connection and reconnects with a fresh, unpredictable
-    /// local port (matching the real BigWorld client's own disconnect + reconnect
-    /// behavior on this message, confirmed live), so we can't know the exact address to
-    /// expect in advance the way a normal post-login connection lets us.
+    /// local port (the real BigWorld client's disconnect + reconnect behaviour on this
+    /// message), so we can't know the exact address to expect in advance the way a
+    /// normal post-login connection lets us.
     pending_switches: Mutex<HashMap<IpAddr, PendingClient>>,
 }
 
@@ -690,7 +672,7 @@ impl proxy::Handler for BaseHandler {
         }
 
         // The client tears down and reconnects from a fresh, unpredictable local port
-        // after a SwitchBaseApp (confirmed live), so we can't know the exact address to
+        // after a SwitchBaseApp, so we can't know the exact address to
         // expect in advance -- only match by IP, keyed at switch time (see the
         // SwitchBaseApp element handling below).
         if let Some(pending_client) = self.shared.pending_switches.lock().unwrap().remove(&addr.ip()) {
@@ -711,21 +693,20 @@ impl proxy::Handler for BaseHandler {
         _packet: Packet,
         direction: proxy::PacketDirection,
     ) -> Result<(), Self::Error> {
-        // One outbound packet per BaseApp connection is expected to fail here, and it is
-        // not a fault: it is the client's `baseAppLogin` request, sent before the
-        // connection has a session key at all, so there is nothing yet to decrypt it
-        // with. Its reply is what delivers the key (see
-        // [`wgtk::app::base::element::BaseAppLoginReply`]), and every packet after that
-        // decrypts normally.
+        // One outbound packet per BaseApp connection is expected to fail here: the
+        // client's `baseAppLogin` request, which the client sends unencrypted before it
+        // enables Blowfish on the channel (`BaseAppLoginRequestProtocol::sendRequest`).
+        // Decrypting plaintext fails, which is not a fault. Every later packet is
+        // encrypted and decrypts normally.
         //
-        // Logged at DEBUG rather than ERROR so it stops reading as a defect. Anything
-        // failing *after* that reply has been seen is a genuine problem and keeps ERROR.
+        // Logged at DEBUG for a peer whose login reply has not been seen yet. Anything
+        // failing after that reply is a genuine problem and stays at ERROR.
         let addr = peer.addr();
         if self.base_login_seen.contains(&addr) {
             error!(%addr, "Failed to decrypt a packet: ({direction:?})");
         } else {
             debug!(%addr, "Could not decrypt the pre-login packet ({direction:?}): \
-                expected, the session key does not exist yet");
+                expected, baseAppLogin is sent unencrypted");
         }
         Ok(())
     }
@@ -936,28 +917,18 @@ impl BaseHandler {
     /// entity from the most recent `CreateBasePlayer`, never the `Vehicle` that
     /// `CreateCellPlayer` announces alongside it.
     ///
-    /// This used to prefer the `CreateCellPlayer` vehicle over `player_entity_id`, on the
-    /// strength of a v2.3.1.3 capture where battle property updates appeared to decode
-    /// only against `Vehicle`'s table. That was a false positive, disproven on a v2.4.0.0
-    /// battle capture:
+    /// In battle the player entity is the `Avatar`: entering a battle fires a second
+    /// `CreateBasePlayer`, with `entity_type_id=2`. The vehicle is a separate entity.
     ///
-    /// * Entering a battle fires a *second* `CreateBasePlayer`, with `entity_type_id=2`
-    ///   (`Avatar`) -- so the old reasoning's "the base/`Account` entity" premise simply
-    ///   doesn't hold in battle: by then the player entity *is* the `Avatar`.
-    /// * `Vehicle[19] debuff` is `Fixed(4)`; `Avatar[19] ownVehicleAuxPhysicsData` is
-    ///   `Fixed(8)`. Reading the latter as the former consumes half the element, and the
-    ///   4 trailing bytes then get eaten as the next element's id -- which is why the
-    ///   leftovers kept landing on further *plausible-looking* `Vehicle` properties
-    ///   (`isStrafing`, `engineMode`, `gunAnglesPacked`) and made the wrong table look
-    ///   right. Live proof: all 3908 `debuff` reads in one battle were followed by a
-    ///   decode error or a bundle stop, never once by a clean continuation.
-    /// * Replaying that battle's 304 failing packets settles it: as `Vehicle` all 304
-    ///   fail; as `Avatar` all 304 decode to completion, recovering 73% more elements,
-    ///   with `ownVehicleAuxPhysicsData` exactly where the bogus `debuff` used to be.
+    /// Choosing the wrong one fails quietly rather than loudly, because the two tables
+    /// overlap at the same indices with different sizes. `Avatar[19]`
+    /// `ownVehicleAuxPhysicsData` is `Fixed(8)` while `Vehicle[19]` `debuff` is
+    /// `Fixed(4)`; reading the first as the second leaves four bytes that are then taken
+    /// as the next element id, and those often land on other plausible `Vehicle`
+    /// properties, which makes the wrong table look right.
     ///
-    /// The `Vehicle` is still registered in `entities` by `CreateCellPlayer` so that an
-    /// explicit `SelectEntity` naming it resolves a real dispatch table -- it just no
-    /// longer hijacks `SelectPlayerEntity`.
+    /// The `Vehicle` is still registered in `entities` by `CreateCellPlayer`, so an
+    /// explicit `SelectEntity` naming it resolves its own dispatch table.
     fn select_player_entity_id(&self) -> Option<u32> {
         self.player_entity_id
     }
@@ -982,10 +953,10 @@ impl BaseHandler {
                     // `InterfaceElement::REPLY` is a variable-length message with a
                     // 4-byte length, which is exactly what `DebugElementVariable32` reads,
                     // so taking the body verbatim leaves the reader on the next element.
-                    // This used to `break` instead, dropping the rest of the bundle for a
-                    // payload whose *type* is unknown -- a decoding gap, not a framing one.
-                    // `UDPBundleProcessor::dispatchMessages` draws the same line: it warns
-                    // when a reply handler leaves bytes behind, and keeps iterating.
+                    // An unknown reply type is a decoding gap, not a framing one, so it
+                    // must not stop the bundle. `UDPBundleProcessor::dispatchMessages`
+                    // draws the same line: it warns when a reply handler leaves bytes
+                    // behind, and keeps iterating.
                     //
                     // Both sides log their request id, so pairing a reply with the request
                     // it answers is a join over the trace, not state to keep here.
@@ -1023,10 +994,9 @@ impl BaseHandler {
                 info!(%addr, id = DisconnectClient::ID, request_id = ?dc.request_id,
                     "-> Disconnect: 0x{:02X}", dc.element.reason);
             }
-            // The following ids are known (id, length style and length param all confirmed
-            // live against v2.3.1.3, see `re-work/NOTES.md`) but not yet given a proper
-            // structured codec -- read them through their placeholder type so the bundle
-            // can safely keep being read, and trace their raw content.
+            // Elements with a known framing but no codec yet: read through their
+            // placeholder type so the bundle keeps being read, with their raw content
+            // sampled.
             PingDatacenter::ID => return sample_dbg!(self, elt, addr, PingDatacenter),
             AvatarUpdateImplicit::ID => {
                 // The client stamps each of its own outgoing positions with a sequence
@@ -1052,10 +1022,8 @@ impl BaseHandler {
             }
             AckPhysicsCorrection::ID => return trace_dbg!(elt, addr, AckPhysicsCorrection),
             RequestEntityUpdate::ID => {
-                // At INFO while the layout is on probation: it comes from the vanilla
-                // SDK and has not been confirmed against WoT's build. `rest` is the
-                // check -- empty across a session means the stamp list really is bare
-                // `int32`s to the end of the element. Drop to `trace_dbg!` once it holds.
+                // At INFO, with `rest` as hex. Every observed request carries no stamps,
+                // so a populated stamp list, or a ragged `rest`, is worth seeing.
                 let e = elt.read_simple::<RequestEntityUpdate>()?;
                 let r = &e.element;
                 info!(%addr, id = RequestEntityUpdate::ID, rest = %hex(&r.rest),
@@ -1063,12 +1031,9 @@ impl BaseHandler {
                 return Ok(true);
             }
             NrlMsgToCell::ID => {
-                // At INFO, unlike the other `Nrl*` elements: the framing is confirmed
-                // (see `NrlMsgToCell`) but the trailing value is not, so `rest` goes out
-                // as hex rather than a length. Every sample so far is the same four bytes
-                // wide on node 1 at ~10Hz, which is the shape of one periodic scalar --
-                // the hex is what lets that be identified. Drop this to `trace_dbg!` once
-                // the component schema resolves it.
+                // At INFO, unlike the other `Nrl*` elements, with `rest` as hex: the
+                // trailing value is the part no schema describes, so it is the part worth
+                // seeing. On node 1 it is the server tick (see `NrlMsgToCell`).
                 let e = elt.read_simple::<NrlMsgToCell>()?;
                 let NrlMsgToCell(stream) = &e.element;
                 info!(%addr, id = NrlMsgToCell::ID, messages = stream.messages.len(),
@@ -1167,10 +1132,10 @@ impl BaseHandler {
                     // `InterfaceElement::REPLY` is a variable-length message with a
                     // 4-byte length, which is exactly what `DebugElementVariable32` reads,
                     // so taking the body verbatim leaves the reader on the next element.
-                    // This used to `break` instead, dropping the rest of the bundle for a
-                    // payload whose *type* is unknown -- a decoding gap, not a framing one.
-                    // `UDPBundleProcessor::dispatchMessages` draws the same line: it warns
-                    // when a reply handler leaves bytes behind, and keeps iterating.
+                    // An unknown reply type is a decoding gap, not a framing one, so it
+                    // must not stop the bundle. `UDPBundleProcessor::dispatchMessages`
+                    // draws the same line: it warns when a reply handler leaves bytes
+                    // behind, and keeps iterating.
                     //
                     // Both sides log their request id, so pairing a reply with the request
                     // it answers is a join over the trace, not state to keep here.
@@ -1179,8 +1144,8 @@ impl BaseHandler {
                     let body = reply.read_simple::<DebugElementVariable32<REPLY_ID>>()?;
 
                     // Read as raw bytes first, then typed: a reply carries no element id,
-                    // so nothing in it says what shape it is. The one shape known so far
-                    // is `baseAppLogin`'s, recognised by position rather than content --
+                    // so nothing in it says what shape it is. The one known shape is
+                    // `baseAppLogin`'s, recognised by position rather than content: the
                     // first reply on a connection, four bytes long. Guarding on both
                     // keeps a later four-byte reply to some *other* request from being
                     // mislabelled a session key.
@@ -1251,17 +1216,16 @@ impl BaseHandler {
                 self.created_entity_types.clear();
                 // Same reasoning as `created_entity_types`: entity ids are reused across
                 // spaces, and a stale `Array` length carried into a new space would be
-                // *worse* than none, since the decoder trusts a tracked length outright
-                // where it merely guesses without one. The player is not preserved here
-                // either: its properties are re-sent on entering the new space.
+                // worse than none. The decoder trusts a tracked length outright, whereas
+                // without one it reports the path as undecodable. The player is not
+                // preserved either: its properties are re-sent on entering the new space.
                 self.entity_properties.clear();
                 // The alias table is per-connection state in the real client and is wiped
                 // by the same reset that clears `id_`/`spaceID_`/`controlledEntities_`
                 // (`memset( idAlias_, 0, sizeof( idAlias_ ) )`). Aliases are small ints
                 // reused from scratch in the next space, so keeping them across a reset
                 // would silently resolve a new space's alias to a dead entity from the
-                // old one -- the same class of bug as the `entities` map, which is why
-                // that is cleared here too.
+                // old one, for the same reason `entities` is cleared above.
                 self.id_aliases.clear();
                 self.player_entity_id = None;
 
@@ -1271,13 +1235,12 @@ impl BaseHandler {
                     self.player_entity_id = Some(player_entity_id);
                 }
 
-                // `selected_entity_id` isn't necessarily the player entity (see
-                // `SelectEntity`/`SelectAliasedEntity`, not tracked here), but whatever
-                // it pointed to is gone now that `entities` was just cleared -- keeping
-                // it around would leave the `ENTITY_METHOD`/`ENTITY_PROPERTY` arms below
-                // holding a dangling id into `entities`, which used to `unwrap()` a
-                // `None` and panic this connection's poll worker thread silently (no
-                // `JoinHandle::join()` anywhere to surface it -- see `ThreadPoll`).
+                // `selected_entity_id` may name any entity (see `SelectEntity`/
+                // `SelectAliasedEntity`), and whatever it named is gone now that
+                // `entities` was cleared. Keeping it would leave the `ENTITY_METHOD`/
+                // `ENTITY_PROPERTY` arms holding a dangling id into `entities`. A panic
+                // there would kill this connection's poll worker thread with nothing to
+                // report it, since no `JoinHandle::join()` surfaces it (see `ThreadPoll`).
                 self.selected_entity_id = self.select_player_entity_id();
 
             }
@@ -1320,12 +1283,9 @@ impl BaseHandler {
                 }
 
                 // `vehicle_id` is a distinct `Vehicle` entity, not the player's own base
-                // entity (confirmed live -- see the doc comment on
-                // `client::element::CreateCellPlayer::vehicle_id`). Register it so a later
-                // `SelectEntity` targeting it can resolve a real dispatch table, instead of
-                // whatever entity happened to be selected before (previously misattributed
-                // to the player's `Account` entity, which then failed to decode the
-                // vehicle's own properties past `Account`'s shorter property table).
+                // entity (see `client::element::CreateCellPlayer::vehicle_id`). Register it
+                // so a later `SelectEntity` targeting it resolves the `Vehicle` dispatch
+                // table rather than whatever entity was selected before.
                 match self.shared.dispatch.entity_from_name("Vehicle") {
                     Some((vehicle_type_id, _)) => {
                         self.entities.insert(ccp.element.vehicle_id, (vehicle_type_id, Value::Dict(BTreeMap::new())));
@@ -1364,21 +1324,15 @@ impl BaseHandler {
                 let sba = elt.read_simple::<SwitchBaseApp>()?;
 
                 // A `0.x.x.x` address, or a real-looking address with port 0, is never
-                // valid for a real game server -- seeing one here means the bundle's read
-                // position already desynced on an earlier element (confirmed live: a busy
-                // battle with other entities in view exercises `SelectAliasedEntity`/
-                // `CreateEntity`, still unconfirmed/undecoded, see their doc comments) and
-                // these 9 bytes are garbage, not a real `SwitchBaseApp`. Trusting it would
-                // register the garbage address as this peer's reconnect target below, so
-                // when the client's real reconnect arrives, this proxy forwards it into a
-                // black hole it can never reach -- confirmed live to be exactly what an
-                // "instant" battle disconnect turned out to be. Confirmed live a second
-                // time, worse: forwarding a subsequent packet to a port-0 address makes
-                // the OS-level send fail with `EINVAL`, which isn't a `ConnectionReset`
-                // and so isn't handled as a per-peer drop -- it propagates all the way out
-                // of the base app's `run()` loop and kills request handling for every
-                // connected client, not just this one. Bail out loudly instead of
-                // chaining into either failure mode.
+                // valid for a real game server. Seeing one means the bundle's read position
+                // desynced on an earlier element and these 9 bytes are garbage, not a real
+                // `SwitchBaseApp`. Trusting it has two consequences. The garbage address
+                // becomes this peer's reconnect target, so the client's real reconnect is
+                // forwarded somewhere it can never arrive and the session drops. And
+                // sending to a port-0 address fails with `EINVAL`, which is not a
+                // `ConnectionReset`, so it is not handled as a per-peer drop: it propagates
+                // out of the base app's `run()` loop and stops request handling for every
+                // connected client. Bail out loudly instead.
                 // The `0.x.x.x`/port-0 checks below are necessary but not sufficient: a
                 // desynced read can yield an address that passes both, and adopting it as
                 // the peer's real address kills the connection (inbound stops dead while
@@ -1418,8 +1372,8 @@ impl BaseHandler {
                 peer.set_real_addr(sba.element.base_addr.into());
 
                 // The client tears down its whole connection and reconnects fresh after
-                // this (confirmed live), from an unpredictable new local port, so
-                // pre-register the session by IP alone for `accept_peer` to pick up.
+                // this, from an unpredictable new local port, so pre-register the session
+                // by IP alone for `accept_peer` to pick up.
                 if let Some(blowfish) = peer.blowfish_arc() {
                     self.shared.pending_switches.lock().unwrap().insert(addr.ip(), PendingClient {
                         base_app_addr: sba.element.base_addr.addr,
@@ -1561,21 +1515,16 @@ impl BaseHandler {
                 }
 
             }
-            // The following ids are known (id, length style and length param all confirmed
-            // live against v2.3.1.3, see `re-work/NOTES.md`) but not yet given a proper
-            // structured codec -- read them through their placeholder/real type so the
-            // bundle can safely keep being read, and trace their content.
-            // Note: ids 0x29..=0x40 (the AVATAR_UPDATE_*_CALLBACK combinatorial messages)
-            // have no known length style yet and so aren't covered here -- they still fall
-            // through to the generic catch-all below, which stops reading the bundle.
+            // Elements with a known framing, read through their own type so the bundle
+            // keeps being read. Those still without a codec go through `sample_dbg!`.
             Authenticate::ID => return trace_dbg!(elt, addr, Authenticate),
             BandwidthNotification::ID => return trace_dbg!(elt, addr, BandwidthNotification),
             SetGameTime::ID => return trace_dbg!(elt, addr, SetGameTime),
             DummyPacket::ID => return sample_dbg!(self, elt, addr, DummyPacket),
             SpaceProperty::ID => return sample_dbg!(self, elt, addr, SpaceProperty),
             AddSpaceGeometryMapping::ID => {
-                // INFO while the layout is on probation -- it was recovered from a single
-                // capture. `rest` empty across sessions is what confirms it.
+                // At INFO, and `rest` as hex: a non-empty `rest` means the layout does not
+                // fit this payload, which is worth seeing whenever it happens.
                 let e = elt.read_simple::<AddSpaceGeometryMapping>()?;
                 let m = &e.element;
                 info!(%addr, id = AddSpaceGeometryMapping::ID, rest = %hex(&m.rest),
@@ -1586,14 +1535,10 @@ impl BaseHandler {
             RemoveSpaceGeometryMapping::ID => return sample_dbg!(self, elt, addr, RemoveSpaceGeometryMapping),
             CreateEntity::ID => {
                 // Record the entity's type so a later `SelectEntity` targeting it can
-                // resolve a dispatch table. Without this, only the player's own base
-                // entity (`CreateBasePlayer`) and vehicle (`CreateCellPlayer`) were ever
-                // known, so every message aimed at any *other* entity fell through to a
-                // "not tracked" warning -- which is what kept the `Nested`/
-                // `SliceEntityProperty` codecs from ever being exercised against real
-                // traffic, since those target exactly such entities. See
-                // `created_entity_types` for why this deliberately doesn't go into
-                // `entities`.
+                // resolve a dispatch table. This is the only source of type information
+                // for entities other than the player's own base entity and vehicle, which
+                // are the entities `Nested`/`SliceEntityProperty` mostly target. See
+                // `created_entity_types` for why this does not go into `entities`.
                 let e = match elt.read_simple::<CreateEntity>() {
                     Ok(e) => e,
                     // Worth its own warning rather than just propagating: this is the only
@@ -1976,22 +1921,15 @@ impl BaseHandler {
                             true
                         }
                         MethodCall::Unknown { .. } => {
-                            // Unlike `BASE_ENTITY_METHOD` (always Variable16, confirmed
-                            // safe regardless of exposed id), `EntityMethod`'s fallback
-                            // for an exposed id outside our table is Variable8 (max 254
-                            // bytes) -- confirmed live to be wrong here: our reconstructed
-                            // `client_methods` table is missing this id (most likely a
-                            // dynamic-component method, see the TODO on
-                            // `CreateBasePlayer::entity_components_count` -- this project
-                            // doesn't model those at all), not something the real client
-                            // fails to recognize too, and the real call was longer than
-                            // 254 bytes. Confirmed by a live capture: an entity name
-                            // string (a bot vehicle's) got split across two separately
-                            // logged "Unknown" calls, and reading continued into unrelated
-                            // bytes afterward, eventually misparsing them as a bogus
-                            // `CreateBasePlayerHeader` with garbage "python" content. So
-                            // stop reading the rest of this bundle rather than trust the
-                            // position past a truncated read.
+                            // Unlike `BASE_ENTITY_METHOD` (always Variable16), an
+                            // `EntityMethod` whose exposed id is outside our table falls
+                            // back to Variable8, at most 254 bytes. An id missing from the
+                            // reconstructed `client_methods` table is most likely a
+                            // dynamic-component method, and its real call can be longer
+                            // than that, so the read can end mid-argument and everything
+                            // after it in the bundle is misread. Stop reading the bundle
+                            // rather than trust the position after a possibly truncated
+                            // read.
                             warn!(%addr, id, "<- Entity method (unrecognized exposed id, stopping bundle): ({entity_id}) {call:?}");
                             false
                         }

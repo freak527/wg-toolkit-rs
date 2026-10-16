@@ -28,12 +28,11 @@ use crate::script::{
 /// `entities` is indexed by wire type id minus one: entity type ids are allocated as a
 /// contiguous 1-based sequence matching `script.entities`' own order (see
 /// [`crate::script::Entity::id`]), followed immediately by one slot per
-/// `script.dynamic_components` entry, same order -- confirmed live (2026-08-31) via a
-/// Frida dump of a running client's `EntityDescriptionMap` (`re-work/frida/
-/// dump_entity_types.js`): dynamic components get their own real, independently
-/// creatable entity type id, continuing the same counter right after the last real
-/// entity, in declaration order, deduped by name (see `script::load`'s
-/// `seen_components`) -- `StaticComponents` never get a slot of their own, only folded
+/// `script.dynamic_components` entry, same order. Dynamic components get their own,
+/// independently creatable entity type id in the client's `EntityDescriptionMap`,
+/// continuing the same counter right after the last real entity, in declaration order,
+/// deduped by name (see `script::load`'s `seen_components`). `StaticComponents` never
+/// get a slot of their own, only folded
 /// into whatever entity's table references them via `<ofEntity>`. So a `Vec` slot still
 /// maps directly to each id, no `HashMap` needed -- use [`Self::entity_from_id`] rather
 /// than indexing it directly, since the wire id is off by one from the backing storage.
@@ -182,12 +181,12 @@ fn is_property_exposed(property: &Property) -> bool {
 /// Whether this property is both client-visible *and* base-hosted (BigWorld's
 /// `DataDescription::isBaseData()`, gated on the `DATA_BASE` flag bit specifically) --
 /// unlike [`is_property_exposed`], this excludes `AllClients`/`OwnClient`, which are
-/// cell-hosted (confirmed live: a `CreateBasePlayer` entity_data built with the wider
-/// filter reads past its own declared element length, because cell-hosted properties
-/// like `AvatarObserver`'s `remoteCamera`/`isObserverFPV`/`numOfObservers`, all flagged
-/// plain `OWN_CLIENT` with no `BASE_AND_CLIENT`, aren't actually part of the base
-/// creation payload at all -- they arrive later, opaque, inside `CreateCellPlayer`'s own
-/// `cell_data` blob). Only [`build_entity_data_ty`] needs this narrower filter: the
+/// cell-hosted. Cell-hosted properties such as `AvatarObserver`'s `remoteCamera`/
+/// `isObserverFPV`/`numOfObservers`, flagged plain `OWN_CLIENT` with no
+/// `BASE_AND_CLIENT`, are not part of the base creation payload: they arrive inside
+/// `CreateCellPlayer`'s own `cell_data` blob. A `CreateBasePlayer` entity_data type built
+/// with the wider filter would read past its element. Only [`build_entity_data_ty`]
+/// needs this narrower filter: the
 /// exposed-id property table built by [`build_property_table`] legitimately covers
 /// every client-visible property regardless of hosting, since an individual
 /// property-change broadcast can originate from either side.
@@ -250,20 +249,12 @@ fn property_length(property: &Property) -> ElementLength {
     match ty_stream_size(&property.ty) {
         Some(size) => ElementLength::Fixed(size as u32),
         // Unlike methods (`method_length` above), a property has no per-declaration
-        // `VariableLengthHeaderSize`-equivalent in this project's script model to read a
-        // real preferred size from -- properties don't expose one in the entity XML the
-        // way methods do. `Variable8` here is a live-evidence-backed guess, not a
-        // confirmed-live constant like the one on `EntityMethod::read_length`: every
-        // variable-sized property observed live so far that uses this fallback (e.g.
-        // `Avatar::arenaExtraData`, a `PYTHON` property) failed to decode with the
-        // previous `Variable16` guess (`failed to fill whole buffer`, consistently, on
-        // this one property, while every *fixed*-size property on the same entity
-        // decoded fine) -- exactly what a too-wide length prefix looks like. `Variable8`
-        // also mirrors `EntityMethod`'s own confirmed-live default for anything without a
-        // declared preferred size (Mercury's `DEFAULT_VARIABLE_LENGTH_HEADER_SIZE`
-        // sentinel), which is at least a principled guess rather than an arbitrary one.
-        // Flag for re-evaluation if a *larger* (>254 byte) variable-sized property is
-        // ever observed failing under this new guess instead.
+        // `VariableLengthHeaderSize` equivalent in the entity XML to read a preferred
+        // size from. `Variable8` is the fallback because it matches Mercury's
+        // `DEFAULT_VARIABLE_LENGTH_HEADER_SIZE`, the default `EntityMethod::read_length`
+        // uses, and because a `Variable16` prefix fails on variable-sized properties such
+        // as `Avatar::arenaExtraData` while the same entity's fixed-size properties
+        // decode. A variable-sized property longer than 254 bytes would not fit it.
         None => ElementLength::Variable8,
     }
 }
@@ -417,21 +408,18 @@ fn build_method_table(
 
     // Then each static component targeting this entity, appended after that sort in
     // component order, its own methods size-sorted among themselves -- exactly as
-    // [`build_property_table`] does for properties, and for the same measured reason.
+    // [`build_property_table`] does for properties.
     //
-    // Read out of the running client rather than inferred: `MethodDescription`'s exposed
-    // index (int32 at +152, and +148 in declaration order) reports `LaPingerComponent`'s
-    // `pingMeAndThenJustTouchMe` as **43** on `Account`. `Account` owns 41 client methods
-    // (slots 0..40), and the only other component methods targeting it are
-    // `AccountBattleRoyaleTournamentComponent`'s two, which take 41 and 42 -- so 43 is the
-    // single arrangement consistent with the dump. The live server really does address 43:
-    // it stopped 10 bundles in one battle while the table ended at 41.
+    // For example, the client's own `MethodDescription` exposed index (int32 at +152)
+    // puts `LaPingerComponent`'s `pingMeAndThenJustTouchMe` at **43** on `Account`.
+    // `Account` owns 41 client methods (slots 0..40), and the only other component
+    // methods targeting it are `AccountBattleRoyaleTournamentComponent`'s two, at 41 and
+    // 42, so 43 is the only consistent arrangement.
     //
     // Going through [`collect_methods`] rather than reading `component.interface` directly
-    // is what keeps the exposure and dedup rules identical to the entity's own. Confirmed
-    // live 2026-09-16: `Avatar`'s cell table went 26 -> 24 entries once
-    // `AvatarInBattleVehicleSwitch`'s two unexposed cell methods stopped taking slots, and
-    // the outbound bundle errors that caused went 191 -> 0 in a full battle.
+    // keeps the exposure and dedup rules identical to the entity's own: unexposed
+    // component methods take no slot, so `AvatarInBattleVehicleSwitch`'s two unexposed
+    // cell methods leave `Avatar`'s cell table at 24 entries, not 26.
     let entity_name = &*entity_interface.name;
     for component in static_components {
         if !component.of_entities.iter().any(|e| e == entity_name) {
@@ -660,8 +648,7 @@ mod tests {
     /// Ground truth: `MethodDescription`'s exposed index (int32 at +152) in the running
     /// client reports `LaPingerComponent::pingMeAndThenJustTouchMe` as **43** on `Account`,
     /// which owns 41 client methods (0..40) and takes 41/42 from
-    /// `AccountBattleRoyaleTournamentComponent`. The live server addresses 43 and stopped
-    /// 10 bundles in one battle while the table ended at 41.
+    /// `AccountBattleRoyaleTournamentComponent`, so the server addresses it as 43.
     #[test]
     fn component_methods_continue_the_entity_id_space() {
 

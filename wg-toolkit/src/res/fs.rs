@@ -760,10 +760,9 @@ impl NodeCache {
                 .as_dir_mut()
                 .expect("current directory should effectively be a directory");
 
-            // More than one package can legitimately ship the same file path (confirmed
-            // live against a real WoT install, v2.4.0.0: 218 per-map `.pkg` files, several
-            // `_hd` variants of the same map, apparently share some non-texture file) --
-            // whichever package is indexed last for that path simply wins, matching
+            // More than one package can legitimately ship the same file path (per-map
+            // `.pkg` files and their `_hd` variants share some non-texture files).
+            // Whichever package is indexed last for that path wins, matching
             // `fs::read_dir`'s (arbitrary, OS-dependent) enumeration order. The shadowed
             // node stays in `self.nodes` unreferenced (a harmless small leak) rather than
             // being removed, since removing it would shift every later index.

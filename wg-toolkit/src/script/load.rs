@@ -73,34 +73,24 @@ pub fn load(fs: &ResFilesystem) -> io::Result<Script> {
 
     }
 
-    // The base game itself also declares its own "static"/"dynamic" components, the same
-    // shape as an extension's (`<ofEntity>`-folded def files), just rooted at plain
-    // `scripts/component_defs/` instead of `<ext>/scripts/component_defs/` and listed by
-    // `scripts/components.xml` instead of an `extension.xml`'s `Components` block (e.g.
-    // `AvatarInBattleVehicleSwitch`, folded into `Avatar`) -- previously not parsed at
-    // all here, which silently dropped every base-game component's properties/methods
-    // from every entity's exposed-id table (confirmed live: real property updates for
-    // entity types like `Avatar` referenced exposed ids past the end of this project's
-    // table, entirely accounted for by these missing base components once added back).
-    // NOT empirically confirmed whether these fold in before or after every extension's
-    // own components in the live client's actual exposed-id order -- placed first here
-    // as the natural guess (base components predate any extension), matching how
-    // `scripts/entities.xml`'s own entities are already ordered before extension ones.
+    // The base game declares its own static and dynamic components, shaped like an
+    // extension's (`<ofEntity>`-folded def files) but rooted at plain
+    // `scripts/component_defs/` and listed by `scripts/components.xml` instead of an
+    // `extension.xml`'s `Components` block (e.g. `AvatarInBattleVehicleSwitch`, folded
+    // into `Avatar`). Their properties and methods take slots in each entity's exposed-id
+    // tables, so leaving them out shifts every id after them.
     //
-    // `seen_components` dedupes by name across this whole function (base game AND every
-    // extension, `StaticComponents` AND `DynamicComponents` alike): the same component
-    // name can legitimately appear more than once in the raw data (confirmed live in the
-    // base game's own `scripts/components.xml` -- e.g. `SecondaryGunComponent` is listed
-    // under both `StaticComponents` and `DynamicComponents`, and a handful of names like
-    // `NetworkReplicationPointComponent` even repeat within the same `DynamicComponents`
-    // list), but only ever gets ONE real slot: a live Frida dump of the running client's
-    // `EntityDescriptionMap` (`re-work/frida/dump_entity_types.js`) showed each dynamic
-    // component name exactly once, in first-occurrence order -- a second listing further
-    // down was silently not assigned its own id. Skipping every occurrence past the first
-    // keeps this project's dynamic-component id sequence aligned with that live table
-    // (confirmed: before this fix, `EntityDescriptionMap` index 256 lived on
-    // `LSVehicleShotChargerComponent`, but this project's un-deduped list put a duplicate
-    // `SecondaryGunComponent` at index ~93, shifting every id after it by one).
+    // Whether they fold in before or after the extensions' own components is not
+    // established. They are placed first here, matching how `scripts/entities.xml`'s own
+    // entities come before extension ones.
+    //
+    // `seen_components` dedupes by name across this whole function (base game and every
+    // extension, `StaticComponents` and `DynamicComponents` alike). A name can appear more
+    // than once in the raw data: `SecondaryGunComponent` is listed under both lists in
+    // `scripts/components.xml`, and names like `NetworkReplicationPointComponent` repeat
+    // within one list. The client's `EntityDescriptionMap` gives each name one slot, at
+    // its first occurrence, so later occurrences are skipped; keeping one would shift
+    // every dynamic-component id after it by one.
     let mut seen_components = HashSet::new();
 
     {
@@ -156,32 +146,19 @@ pub fn load(fs: &ResFilesystem) -> io::Result<Script> {
     // "AccountBattleRoyaleTournamentComponent" 2 client methods (0x29, 0x2A) and Account's
     // own last interface-derived method (0x28) -- see re-work/HANGAR_LOADING.md.
     //
-    // An extension can also carry its own "Entities" section (`ClientServerEntities` --
-    // has a real def file, same convention as `scripts/entity_defs/`; and
-    // `ServerOnlyEntities` -- no def file exists anywhere for these, no client-visible
-    // surface, so they're only logged, never parsed/generated). Continuing the main
-    // list's numbering here (same ordering rule as component folding) was CONFIRMED
-    // live (2026-08-29): a Frida script (`re-work/frida/dump_entity_types.js`) located
-    // the running client's actual `BW::EntityDescriptionMap` vector directly in process
-    // memory (no address/offset knowledge needed -- found by scanning for a known entity
-    // name string, then walking the confirmed 808-byte `EntityDescription` stride outward
-    // until the pattern breaks) and read off every entity in true index order. Every one
-    // of the 10 currently-known extension entities (`battle_royale`'s `Mine`/`Loot`/
-    // `Placement`/`InfluenceZone`/`BattleRoyaleRadio`/`ThunderStrike`, `comp7`'s
-    // `Comp7Lighting`, `comp7_core`'s `ApplicationPoint`, `server_side_replay`'s
-    // `ReplayAccount`, `story_mode`'s `SPGZone`) landed at exactly the id this generator
-    // already assigned it. See `Entity::from_extension` and doc/ENTITY.md.
+    // An extension can also carry its own "Entities" section. `ClientServerEntities` have
+    // def files in the same layout as `scripts/entity_defs/`. `ServerOnlyEntities` have no
+    // def file and no client-visible surface, so they are only logged. Client-server
+    // entities continue the main list's numbering, in the same order as component
+    // folding: extensions alphabetically, then declaration order within each. See
+    // `Entity::from_extension` and doc/ENTITY.md.
     //
-    // The same live dump also turned up something not modeled by this codebase at all:
-    // the id sequence keeps going past the last real entity (`SPGZone`, 0x32) into
-    // dozens more slots with clearly component-shaped names (`DogTagComponent`,
-    // `HealthComponent`, `VehicleBuff`, ...) all the way past 0x100 -- i.e. the live
-    // client's `EntityDescriptionMap` is NOT limited to what `entities.xml`-derived
-    // `Entity` values would suggest; static/dynamic extension components apparently get
-    // their own real slots in this same id space too, distinct from the
-    // already-confirmed exposed-method-id folding. Not yet understood what (if anything)
-    // reads those ids off the wire -- worth revisiting for the "dynamic components" open
-    // question in doc/ENTITY.md.
+    // The client's `EntityDescriptionMap` continues the same id sequence past the last
+    // entity (`SPGZone`, 0x32) into slots named after components (`DogTagComponent`,
+    // `HealthComponent`, `VehicleBuff`, ...), beyond 0x100. Components therefore also
+    // have ids in this space, separate from their methods and properties being folded
+    // into their owner's exposed-id tables. Nothing here assigns those ids, and what reads
+    // them off the wire, if anything, is not known.
     let mut ext_names: Vec<String> = fs.read_dir("")?
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.stat().is_dir())
@@ -314,12 +291,11 @@ fn prepend_interface(child: &mut Interface, mut parent: Interface) {
 /// `Implements`, properties and methods, and every inherited member comes *first* in
 /// declaration order -- which is what the size-sorted exposed-id tables break ties on.
 ///
-/// Nothing in `scripts/entities.xml` hints that this is happening. Found live, not
-/// inferred: the server addressed `SPGZone` -- type id 0x32, from `story_mode`, whose
-/// entire def is `<Parent>AreaOfEffect</Parent>` -- with exposed client method 0 and an
-/// `AreaOfEffect::playEffect(STRING, VECTOR3, FLOAT32)` payload, while this loader gave it
-/// an empty method table: 12 stopped bundles in one battle. 15 entities in the current
-/// client use `<Parent>`, chained up to three deep (`HeroTank` ->
+/// Nothing in `scripts/entities.xml` hints that this is happening. `SPGZone`, type id
+/// 0x32 from `story_mode`, has `<Parent>AreaOfEffect</Parent>` as its entire def: without
+/// inheritance its method table is empty, yet the server calls
+/// `AreaOfEffect::playEffect(STRING, VECTOR3, FLOAT32)` on it as exposed method 0. 15
+/// entities in the current client use `<Parent>`, chained up to three deep (`HeroTank` ->
 /// `ClientSelectableCameraVehicle` -> `ClientSelectableCameraObject` ->
 /// `ClientSelectableObject`).
 ///

@@ -187,11 +187,10 @@ pub struct TyDict {
     pub properties: Vec<TyDictProp>,
     /// BigWorld's `FIXED_DICT` `AllowNone` flag: the value is preceded on the wire by a
     /// single discriminator byte (`0` = the whole dict is Python `None`, no property
-    /// bytes follow; `1` = present, properties follow as normal) -- confirmed live
-    /// (WoT v2.3.1.3): `BATTLE_GOODIE_RECORD`/`GOODIE_RESOURCE`/`GOODIE_STATE_INFO`
-    /// (used by `Avatar::goodiesSnapshot`) all declare this, and decoding them without
-    /// consuming that leading byte desyncs every nested dict after the first one,
-    /// eventually overrunning the enclosing element's declared length. See
+    /// bytes follow; `1` = present, properties follow as normal).
+    /// `BATTLE_GOODIE_RECORD`/`GOODIE_RESOURCE`/`GOODIE_STATE_INFO` (used by
+    /// `Avatar::goodiesSnapshot`) declare it, and decoding them without consuming that
+    /// leading byte desyncs every nested dict after the first one. See
     /// `FixedDictDataType`'s `fromSourceToStream`/`fromStreamToSink` in the real engine
     /// source (`entitydef/data_types/fixed_dict_data_type.cpp`).
     pub allow_none: bool,
