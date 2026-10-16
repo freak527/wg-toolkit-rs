@@ -1,14 +1,28 @@
-//! Brute-force a captured `SliceEntityProperty`/`NestedEntityProperty` payload against
-//! *every* entity and dynamic-component property table in the loaded script model, under
-//! both the nested-single and slice leaf interpretations, to find which (if any) table
-//! the bytes actually decode against.
+//! Try a captured `SliceEntityProperty`/`NestedEntityProperty` payload against *every*
+//! entity and dynamic-component property table in the loaded script model, under both the
+//! nested-single and slice leaf interpretations, to find which (if any) table the bytes
+//! actually decode against.
 //!
 //! Pass a game dir, and optionally a file of hex payloads (one per line) to replace the
-//! built-in samples. Output marks each decode as certain (`SLICE `), append-inferred
-//! (`SLICE~`, see `decode_compressed_path`) or ambiguous (`SLICE?`).
+//! built-in samples.
 //!
-//! Note the per-table summary only lists tables scoring above zero, so count the
-//! ambiguous column too when judging whether a table is the right one.
+//! # Reduced scope since the length guess was removed
+//!
+//! This tool was written when `decode_compressed_path` would brute-force an `Array`'s
+//! length, trying every value up to a cap and keeping each self-consistent parse. That
+//! guessing is gone: a path's bit layout depends on the *live* length of every `Array` it
+//! crosses, so the decoder now needs the entity's tracked property values and reports
+//! "no consistent decode" without them.
+//!
+//! This tool has no tracked values -- it only has tables -- so **any payload whose path
+//! crosses an `Array` is undecodable here**, and will simply score zero against every
+//! table. It still settles the question for paths that cross only fixed-shape containers
+//! (dicts, tuples, fixed structs), which is what the built-in control samples are.
+//!
+//! For a payload that does cross an `Array`, the live proxy is the only place it can be
+//! decoded, because only it holds the entity state. The `SLICE?` ("ambiguous") marker
+//! below is likewise a leftover: the descent can no longer fork, so it should never fire.
+//! If it ever does, that is a bug worth reporting rather than a near miss.
 
 use std::env;
 use std::fs;

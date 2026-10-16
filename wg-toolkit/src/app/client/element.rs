@@ -479,15 +479,10 @@ pub type SpaceProperty = DebugElementVariable16<{ id::SPACE_PROPERTY }>;
 /// `uint16`; WoT split `spaceData` into one element id per key, so there is no key field
 /// here -- the id is the key.
 ///
-/// Layout recovered from a live capture, which accounts for all 109 bytes exactly:
-/// `[space_id u32][entry_id 8][packed-len path][transform 16 x f32][unk u8]`. The
-/// 8-byte `entry_id` is confirmed by type -- `SpaceEntryID` derives from
-/// `Mercury::Address` (`network/basictypes.hpp`) -- and by content: the sample decodes
-/// to a plausible internal `10.147.8.49:16415` with salt 9, through the same
-/// [`WgSocketAddrV4`] codec that `SwitchBaseApp` already uses against live traffic.
-///
-/// The decisive evidence is the arithmetic, though: `4 + 8 + 1 + 31 + 64 + 1` accounts
-/// for all 109 bytes of the capture with nothing left over.
+/// Laid out as `[space_id u32][entry_id 8][packed-len path][transform 16 x f32][unk u8]`.
+/// `entry_id` is a `SpaceEntryID`, which derives from `Mercury::Address`
+/// (`network/basictypes.hpp`) and so reads through the same [`WgSocketAddrV4`] codec as
+/// [`SwitchBaseApp`].
 #[derive(Debug, Clone)]
 pub struct AddSpaceGeometryMapping {
     pub space_id: u32,
@@ -497,15 +492,14 @@ pub struct AddSpaceGeometryMapping {
     pub path: String,
     /// The placement transform, 16 floats in wire order.
     ///
-    /// Deliberately not a `Mat4`: the only sample so far is the identity, which cannot
-    /// distinguish row-major from column-major. Interpreting it needs a capture with a
-    /// translation or rotation in it.
+    /// Not a `Mat4`, because the row- versus column-major order is unknown: every
+    /// observed transform is the identity, which cannot distinguish the two.
     pub transform: [f32; 16],
-    /// One trailing byte, meaning unknown; `0x01` in the only sample.
+    /// One trailing byte, meaning unknown; `0x01` in all observed traffic.
     pub unk: u8,
-    /// Anything beyond the layout above. Always empty if it is right -- kept rather than
-    /// raised as an error so a mismatch reports itself without stopping the bundle, the
-    /// shape having been inferred from a single capture.
+    /// Anything beyond the layout above; empty for a well-formed message. Reported here
+    /// rather than raised as an error so a mismatch does not stop the rest of the
+    /// bundle from decoding.
     pub rest: Vec<u8>,
 }
 
@@ -548,18 +542,16 @@ pub type RemoveSpaceGeometryMapping = DebugElementVariable16<{ id::REMOVE_SPACE_
 
 /// Sent from the cell when another entity (not the client's own player) enters its Area
 /// of Interest -- see [`EnterAoi`]/[`EnterAoiOnVehicle`] for the companion message that
-/// actually adds it to the AoI id-alias table. Field order/types otherwise confirmed
-/// against the leaked BigWorld 14.4.1 SDK's vanilla `ServerConnection::createEntity`
-/// (`connection/server_connection.cpp`), but WoT inserts two extra fields
-/// (`unk_u16`/`resource_name`, see their own doc comments) between `entity_type_id` and
-/// `position` that don't exist in that vanilla source -- confirmed live (WoT v2.3.1.3):
-/// assuming vanilla's layout made every single `position`/`direction` decode to the
-/// exact same nonsense value regardless of entity (reconstructing the raw wire bytes
-/// showed those "positions" were actually always the literal bytes of `resource_name`'s
-/// length-prefixed string, misread 13 bytes too early), for every entity type observed
-/// (`Vehicle`, `AreaDestructibles`, `NetworkEntity`, ...) -- so this extra pair is
-/// unconditional, not specific to one entity type. Like [`CreateCellPlayer`]/
-/// [`CreateBasePlayer`], another case of WoT diverging from this same vanilla source.
+/// actually adds it to the AoI id-alias table.
+///
+/// Field order and types otherwise follow the vanilla
+/// `ServerConnection::createEntity` (`connection/server_connection.cpp`), except that
+/// WoT inserts two extra fields between `entity_type_id` and `position`:
+/// `unk_u16` and `resource_name`, each documented on its own field. The pair is
+/// unconditional, present for every entity type, so reading this with the vanilla
+/// layout shifts `position`/`direction` 13 bytes early and decodes them from the bytes
+/// of `resource_name` instead. [`CreateCellPlayer`] and [`CreateBasePlayer`] diverge
+/// from the same vanilla source in the same way.
 ///
 /// The whole payload (`entity_id`/`entity_type_id`/`position`/`direction` included, not
 /// just the trailing property dict) is wrapped server-side in a `CompressionIStream`: a
@@ -603,9 +595,9 @@ pub struct CreateEntity {
     ///
     /// Carried raw because this element's codec is reached without a dispatch table (the
     /// entity's type id is only read *here*, from the same payload). Not a positional dict
-    /// of every `AllClients` property, as this comment used to claim: `addChangedProperties`
-    /// writes a count followed by `(exposed id, value)` pairs, covering only the properties
-    /// at the outer detail level whose event stamp is newer than the LoD's.
+    /// Not a positional dict of every `AllClients` property: `addChangedProperties`
+    /// writes a count followed by `(exposed id, value)` pairs, covering only the
+    /// properties at the outer detail level whose event stamp is newer than the LoD's.
     pub client_data: Vec<u8>,
 }
 
@@ -795,10 +787,9 @@ crate::__struct_simple_codec! {
     /// for the client to notice when *itself* has been stalled (OS-level pause, a
     /// debugger breakpoint, a long GC/loading hitch, ...) for long enough that the
     /// resulting time gap shouldn't be treated as a network issue. Only the 4-byte
-    /// length is confirmed live (`re-work/frida/dump_interfaces.js`); there's no header
-    /// to confirm the field's exact type or unit against, so `threshold` is a plausible
-    /// reading (a timeout/period, `f32` seconds or `u32` milliseconds) rather than a
-    /// confirmed one -- kept as a raw `u32` here to avoid asserting a specific meaning.
+    /// length is known; the field's type and unit are not, so `threshold` is a plausible
+    /// reading (a timeout or period, `f32` seconds or `u32` milliseconds) rather than an
+    /// established one. Kept as a raw `u32` so no specific meaning is asserted.
     #[derive(Debug, Clone, Copy)]
     pub struct ClientSuspensionDetectionEnabled {
         pub threshold: u32,
@@ -977,14 +968,13 @@ impl SimpleElement for SetVehicle {
 
 crate::__struct_simple_codec! {
     /// Sent by the server to inform that subsequent elements will target another entity's
-    /// property/method updates, referenced directly by its full id -- confirmed live
-    /// against WoT v2.3.1.3: the controlled `Vehicle` entity created by
-    /// [`CreateCellPlayer`] gets its own `OwnClient`-flagged property updates selected
-    /// this way, distinct from [`SelectPlayerEntity`] (the base/`Account` entity) and
-    /// from the more compact byte-alias form used for broadcast (`AllClients`)
-    /// properties of *other* nearby entities, [`SelectAliasedEntity`] (not decoded here
-    /// -- its alias table would need [`CreateEntity`]/[`EnterAoi`] decoded first, neither
-    /// confirmed live yet).
+    /// property/method updates, referenced directly by its full id.
+    ///
+    /// The controlled `Vehicle` entity created by [`CreateCellPlayer`] gets its own
+    /// `OwnClient`-flagged property updates selected this way. Distinct from
+    /// [`SelectPlayerEntity`], which targets the base/`Account` entity, and from
+    /// [`SelectAliasedEntity`], the compact byte-alias form used for the broadcast
+    /// (`AllClients`) properties of *other* nearby entities.
     #[derive(Debug, Clone, Copy)]
     pub struct SelectEntity {
         pub entity_id: u32,
@@ -2170,10 +2160,8 @@ enum PathOutcome {
 /// width with it, and the descent follows exactly one branch -- `out` ends up with one
 /// outcome or none.
 ///
-/// This used to brute-force the length instead, branching over `0..=4096` and keeping
-/// every guess that parsed cleanly to the last byte. That is gone: it could only ever
-/// return an answer it had no way to confirm, and tracked values make it unnecessary.
-/// An untracked array now ends the descent and the decode is reported as undecodable.
+/// An `Array` with no tracked value ends the descent, and the decode is reported as
+/// undecodable rather than guessed at.
 ///
 /// `live` is the tracked value of `container` itself, or `None` at the top level (where
 /// `values` is keyed by property name instead) and wherever tracking has no entry.
@@ -2634,11 +2622,8 @@ impl Element<[PropertyDef]> for UpdateEntity {
 }
 /// Tells the client the CellApp's externally reachable address.
 ///
-/// Eight bytes in the only capture so far, decoding through the same [`WgSocketAddrV4`]
-/// codec as [`SwitchBaseApp`] to `185.12.240.49:19111` with salt 0. That address sits in
-/// the same `/24` as every BaseApp this proxy has been handed (`.39`, `.45`, `.69`), and
-/// carries the salt-0 of the other server addresses, which is the evidence for reading
-/// it this way rather than as eight opaque bytes.
+/// Eight bytes, read through the same [`WgSocketAddrV4`] codec as [`SwitchBaseApp`].
+/// The address sits in the same subnet as the BaseApps, with a zero salt.
 #[derive(Debug, Clone)]
 pub struct SetCellAppExtAddress(pub WgSocketAddrV4);
 
@@ -2791,14 +2776,12 @@ impl Element<[MethodDef]> for EntityMethod {
 /// Unlike [`EntityMethod`], there is no `Unknown` fallback here: an unrecognized exposed
 /// id (e.g. one belonging to a *dynamic* component, whose properties this project's model
 /// can't predict at all) has no confirmed wire framing to fall back to. `EntityMethod`'s
-/// "assume Variable8" fallback was confirmed live by hooking the real client's own
-/// `getEntityMethodStreamSize`, specifically for methods -- that confirmation was never
-/// done for properties, and guessing wrong here isn't just a missed decode: it silently
-/// misframes the element, desyncing every following element in the bundle, which was
-/// confirmed live to cascade into misinterpreting unrelated garbage bytes as other
-/// message ids (observed: bogus `SwitchBaseApp` triggers, whose `patch_raw` handling
-/// then corrupted and forwarded real, unrelated packet data to the live game client and
-/// crashed it). An unrecognized exposed id must therefore surface as a read error here,
+/// "assume Variable8" fallback holds for methods but has no equivalent for properties,
+/// and guessing wrong here is not just a missed decode: it silently misframes the
+/// element and desyncs every following element in the bundle. A desync cascades into
+/// reading unrelated bytes as other message ids, up to and including bogus
+/// [`SwitchBaseApp`] triggers whose `patch_raw` handling then forwards corrupted data to
+/// the game client. An unrecognized exposed id must therefore surface as a read error,
 /// so the caller stops decoding this bundle rather than guessing further.
 #[derive(Debug, Clone)]
 pub struct EntityProperty {
@@ -3189,9 +3172,8 @@ mod tests {
     /// Without a tracked value for the `Array` it crosses, a slice path is undecodable.
     ///
     /// The bit width of the index and range fields is a function of the array's live
-    /// length, which is not in the type. This used to brute-force the length and accept
-    /// any guess that parsed cleanly to the last byte; that guess could never be
-    /// confirmed, so it is gone. Not knowing is now reported as not knowing.
+    /// length, which is not in the type, so without a tracked value there is nothing to
+    /// derive it from. Not knowing must be reported as not knowing.
     #[test]
     fn slice_array_range_without_tracked_length_is_undecodable() {
 

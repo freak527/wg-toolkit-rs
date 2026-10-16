@@ -174,9 +174,8 @@ crate::__struct_simple_codec! {
         /// Yaw/pitch/roll, packed like [`crate::app::math::PackedYawPitchRoll`] with
         /// `half_pitch = true` (`YawPitchRoll`'s default in the SDK).
         pub direction: PackedYawPitchRoll,
-        /// Confirmed in vanilla (`// refNum is used to refer to this position later as
-        /// the base for relative positions`): identifies this update so a later relative
-        /// position can reference it as a base.
+        /// Identifies this update so a later relative position can reference it as its
+        /// base.
         pub ref_num: u8,
         pub unk_byte: u8,
     }
@@ -198,9 +197,9 @@ crate::__struct_simple_codec! {
         pub vehicle_id: u32,
         pub position: Vec3,
         pub direction: PackedYawPitchRoll,
-        /// Bit flags; confirmed live bit `0x1` = on-ground (the vanilla source's own
-        /// `AVATAR_UPDATE_EXPLICT_FLAG_ONGROUND`, "must match `cellapp_interface.hpp`").
-        /// Use [`Self::on_ground`] rather than reading the bit directly.
+        /// Bit flags. Bit `0x1` is on-ground
+        /// (`AVATAR_UPDATE_EXPLICT_FLAG_ONGROUND`); read it through [`Self::on_ground`]
+        /// rather than testing the bit directly. The other bits have no known meaning.
         pub flags: u8,
         pub ref_num: u8,
         pub unk_byte: u8,
@@ -240,16 +239,13 @@ impl SimpleElement for AckPhysicsCorrection {
 /// Not an element -- it has no id of its own, since a reply is addressed by the request
 /// id it answers -- so it is a bare [`SimpleCodec`] read straight off the reply body.
 ///
-/// `LoginHandler::onBaseAppLoginSuccess` calls it "the session key that authenticate
-/// message should send", and that is exactly what happens on the wire: the client echoes
-/// this value as [`SessionKey`] at the head of every subsequent outbound bundle.
-/// Confirmed over a full session -- all four replies decoded little-endian matched a
-/// session key the client then sent, byte for byte, and nothing else did.
+/// The client echoes this value as [`SessionKey`] at the head of every subsequent
+/// outbound bundle, which is what authenticates the connection.
 ///
-/// The request itself is never readable by a proxy: it is the first thing the client
-/// sends on a fresh BaseApp connection, before the key that would let the proxy decrypt
-/// that packet exists. So this reply cannot be identified by pairing it with its
-/// request; see the caller for how it is recognised instead.
+/// A proxy cannot read the request that asks for it: `baseAppLogin` is the first thing
+/// the client sends on a fresh BaseApp connection, before the key that would decrypt
+/// that packet exists. The reply therefore cannot be matched to its request by id, and
+/// the caller identifies it by position instead.
 #[derive(Debug, Clone, Copy)]
 pub struct BaseAppLoginReply {
     pub session_key: u32,
@@ -280,12 +276,10 @@ impl SimpleCodec for BaseAppLoginReply {
 pub struct RequestEntityUpdate {
     pub entity_id: u32,
     pub stamps: Vec<i32>,
-    /// Bytes after the last whole stamp. Always empty if the layout above is right.
+    /// Bytes after the last whole stamp; empty for a well-formed message.
     ///
-    /// Kept rather than raised as an error because this shape comes from the vanilla SDK
-    /// and has not been confirmed against WoT's build: erroring here would stop the whole
-    /// bundle on a guess, whereas a non-empty `rest` reports the mismatch and leaves
-    /// everything after it readable.
+    /// A ragged tail is reported here rather than raised as an error, so a payload that
+    /// does not match this layout does not stop the rest of the bundle from decoding.
     pub rest: Vec<u8>,
 }
 
@@ -338,24 +332,15 @@ impl SimpleElement for RequestEntityUpdate {
 /// element differs. What travels this way is the `ServerMethodCallerNode` side of the
 /// tree (the client invoking a dynamic component's server method) plus node lookups.
 ///
-/// Confirmed live: a battle's 120 elements all framed as exactly one message,
-/// `[type 6 (update node)][node id 1]`, with four bytes left in [`NrlStream::rest`].
+/// A non-empty [`NrlStream::rest`] is normal here, not a framing failure: a type-6
+/// (update node) record is terminal because its body is the node's new value, encoded
+/// per the owning component's schema, which nothing on the wire describes.
 ///
-/// Those four bytes are *not* a framing failure, which is what a non-empty `rest` meant
-/// when this was first written. A type-6 record is terminal precisely because its body
-/// is the node's new value, encoded per the owning component's own schema -- so `rest`
-/// holding it is the documented outcome, the same one the inbound direction reaches.
-///
-/// Measured over 769 consecutive samples from one battle, node 1's value is a
-/// little-endian `u32` **server tick**: every message increments it by exactly one, with
-/// no gaps and no repeats, at a measured 10.0 Hz against wall clock -- BigWorld's default
-/// `updateHertz`. So the client echoes the server's current tick back to the cell once
-/// per tick, which makes this a clock acknowledgement, not component data.
-///
-/// It is the server's clock, not the client's: its magnitude (~1.4e6, i.e. ~39 hours at
-/// 10 Hz) tracks server uptime and is unrelated to how long the client has been running,
-/// so it neither starts at zero on connect nor resets when the client does. Treat a
-/// discontinuity here as the server side restarting, never the local session.
+/// In practice almost all traffic on this element is a single type-6 record on node 1,
+/// whose value is a little-endian `u32` **server tick**, sent once per tick at
+/// BigWorld's default 10 Hz `updateHertz` -- the client acknowledging the server clock
+/// rather than replicating component data. The counter tracks server uptime, not the
+/// local session, so a discontinuity in it means the server side restarted.
 #[derive(Debug, Clone)]
 pub struct NrlMsgToCell(pub NrlStream);
 
@@ -382,8 +367,37 @@ pub type AvatarUpdateWardExplicit = DebugElementFixed<{ id::AVATAR_UPDATE_WARD_E
 pub type AckWardPhysicsCorrection = DebugElementFixed<{ id::ACK_WARD_PHYSICS_CORRECTION }, 4>;
 pub type RestoreClientAck = DebugElementFixed<{ id::RESTORE_CLIENT_ACK }, 4>;
 
-pub type ClientToServerHeartbeat = DebugElementFixed<{ id::CLIENT_TO_SERVER_HEARTBEAT }, 0>;
-pub type SendToCell = DebugElementFixed<{ id::SEND_TO_CELL }, 0>;
+/// Keeps the client -> BaseApp connection alive. Carries no bytes: its presence in the
+/// bundle is the whole message, so there is nothing left to decode.
+///
+/// Zero-length, like [`crate::app::client::element::NrlUpdateNodeFlag`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClientToServerHeartbeat;
+
+impl SimpleCodec for ClientToServerHeartbeat {
+    fn write(&self, _write: &mut dyn Write) -> io::Result<()> { Ok(()) }
+    fn read(_read: &mut dyn Read) -> io::Result<Self> { Ok(Self) }
+}
+
+impl SimpleElement for ClientToServerHeartbeat {
+    const ID: u8 = id::CLIENT_TO_SERVER_HEARTBEAT;
+    const LEN: ElementLength = ElementLength::ZERO;
+}
+
+/// Marks the bundle as destined for the cell rather than the base. Payload-less, exactly
+/// as [`ClientToServerHeartbeat`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SendToCell;
+
+impl SimpleCodec for SendToCell {
+    fn write(&self, _write: &mut dyn Write) -> io::Result<()> { Ok(()) }
+    fn read(_read: &mut dyn Read) -> io::Result<Self> { Ok(Self) }
+}
+
+impl SimpleElement for SendToCell {
+    const ID: u8 = id::SEND_TO_CELL;
+    const LEN: ElementLength = ElementLength::ZERO;
+}
 
 // =============================================================================
 // Dynamic entity method dispatch (base & cell)
@@ -459,9 +473,9 @@ impl Element<[MethodDef]> for BaseEntityMethod {
 /// A cell call names its target entity on the wire, and different entity *types* have
 /// different exposed tables, so the element id alone does not identify the method: the
 /// same id means `Avatar::activateEquipment` for one target and
-/// `Vehicle::trackRelativePointWithGun` for another. Decoding every call against the
-/// player's own table silently mis-read the ones aimed at the player's vehicle -- which
-/// in a battle is the overwhelming majority, since gun aiming is sent every tick.
+/// `Vehicle::trackRelativePointWithGun` for another. The target must therefore be
+/// resolved before the call can be decoded; in a battle most calls are aimed at the
+/// player's vehicle rather than the player entity, since gun aiming is sent every tick.
 pub trait CellMethodTables {
     /// Exposed cell methods for `entity_id`, or `None` if the target is unknown (the
     /// call is then reported raw rather than guessed at). `0` is not a real id: it means

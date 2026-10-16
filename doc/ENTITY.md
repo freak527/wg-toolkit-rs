@@ -232,27 +232,48 @@ slots, and one extra byte following the wire id disambiguates within that slot
 `element_id` (+ optional sub-id byte) → `exposed_id` → `AnyMethod::read(exposed_id)`,
 sized per that method's declared length.
 
-### Open question: dynamic components
+### Dynamic components: replicated over BW::NRL, not the property table
 
-Dynamic components have no confirmed wire encoding yet, but their presence is now
-confirmed live: a battle-entry `CreateBasePlayer` for the `Account` entity was captured
-with `entity_components_count: 17` (previously only `0` had ever been observed).
-`CreateBasePlayerAny::read` (`wg-toolkit-cli/src/wot/proxy/mod.rs`) consumes exactly
-`entity_data` + the trailing count byte with zero leftover bytes (confirmed via the
-bundle reader's "remaining data" check, see `net/bundle.rs`), so the 17 components'
-actual data is NOT inline in this message -- it must arrive later via `ENTITY_PROPERTY`
-update messages.
+Dynamic components do not use the classic `ENTITY_PROPERTY`/`ENTITY_METHOD` path at all.
+They replicate over **BW::NRL** ("Network Replication Layer"), a separate node-tree
+protocol absent from the vanilla BigWorld SDK, with its own element family
+(`NRL_CREATE_NODE`, `NRL_UPDATE_NODE`, `NRL_DATA`, `NRL_MSG_TO_CLIENT`,
+`NRL_MSG_TO_CELL`, ...). Every message addresses a node by a 16-bit id, in a tree
+mirroring entity -> dynamic component -> property/method. See the `Nrl*` section of
+`wg-toolkit/src/app/client/element.rs` for the decoded framing, which is validated
+against live captures in both directions.
 
-This is corroborated directly: `Account`'s own static client-visible property table
-(now decoded via `Entity::Property`, see the "Client-visible properties" section
-below) only spans exposed ids `0..3` (`incarnationID`, `requiredVersion_2310`, `name`,
-`initialServerSettings`), yet live battle traffic continuously sends property updates at
-exposed id `19` and others well outside that range. Per elimination, these must belong
-to one of the 17 attached dynamic components -- consistent with `Model::dynamic_components`'s
-doc comment that dynamic components claim no fixed, statically-predictable exposed id.
-Decoding these specific ids would require either observing the exact attach order live
-(e.g. via a Frida hook on the client's component-attach path) or brute-forcing candidate
-dynamic components' property sizes against the captured byte lengths. Not yet attempted.
+What is still missing is not the framing but the **schemas**: a property or method node's
+value is encoded per its component's own schema, addressed by a CGF-runtime component
+type id that this project cannot yet resolve (the wire says 113 for
+`EntityMarkerComponent` where `dynamic_components` has it at 67). Those bytes are
+therefore left undecoded in `NrlStream::rest`. Resolving them needs that registry dumped
+from a live client.
+
+Separately, a `CreateBasePlayer` for `Account` has been captured with
+`entity_components_count: 17` (previously only `0` had been seen), and the element
+consumes `entity_data` + the trailing count byte with zero leftover bytes -- so the
+components' data is not inline in the create. That is consistent with the above: it
+arrives over NRL.
+
+#### Caution: out-of-range exposed ids are not evidence of dynamic components
+
+An earlier version of this section argued that live property updates at exposed ids
+outside an entity's static table (e.g. `Account` id `19` against a `0..3` table) must by
+elimination belong to attached dynamic components. **That inference is not safe**, and
+one case that fit it exactly turned out to be something else entirely.
+
+`Vehicle` creation payloads were seen carrying exposed ids `98` and `147` against a
+50-entry property table -- the textbook signature of a short table missing its dynamic
+components. The real cause was a one-byte misalignment: `CreateEntity` read a 3-byte
+`PackedYawPitchRoll` where WoT sends four, so `client_data` began one byte early and the
+"ids" were misread value bytes. With the byte consumed, the same payloads decode as clean
+ascending runs that consume every byte (see `CreateEntity::direction_unk`).
+
+So before attributing an out-of-table id to a dynamic component, rule out misalignment
+first. The cheap check is monotonicity: `EntityCache::addChangedProperties` writes ids in
+strictly ascending order, so a repeat or a step backwards proves a desync rather than an
+unknown property (`ChangedProperties` enforces this).
 
 **New lead (2026-08-29)**: the live `EntityDescriptionMap` dump described below (done to
 confirm extension entity ids) turned up something not modeled by this codebase at all --
