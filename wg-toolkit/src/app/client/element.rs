@@ -473,7 +473,77 @@ impl Element<EntityDispatch> for CreateBasePlayer<'_> {
 
 pub type DummyPacket = DebugElementVariable16<{ id::DUMMY_PACKET }>;
 pub type SpaceProperty = DebugElementVariable16<{ id::SPACE_PROPERTY }>;
-pub type AddSpaceGeometryMapping = DebugElementVariable16<{ id::ADD_SPACE_GEOMETRY_MAPPING }>;
+/// Maps a geometry (terrain/scene) resource into a space, with the transform to place it.
+///
+/// Vanilla BigWorld carries this inside the single `spaceData` message, keyed by a
+/// `uint16`; WoT split `spaceData` into one element id per key, so there is no key field
+/// here -- the id is the key.
+///
+/// Layout recovered from a live capture, which accounts for all 109 bytes exactly:
+/// `[space_id u32][entry_id 8][packed-len path][transform 16 x f32][unk u8]`. The
+/// 8-byte `entry_id` is confirmed by type -- `SpaceEntryID` derives from
+/// `Mercury::Address` (`network/basictypes.hpp`) -- and by content: the sample decodes
+/// to a plausible internal `10.147.8.49:16415` with salt 9, through the same
+/// [`WgSocketAddrV4`] codec that `SwitchBaseApp` already uses against live traffic.
+///
+/// The decisive evidence is the arithmetic, though: `4 + 8 + 1 + 31 + 64 + 1` accounts
+/// for all 109 bytes of the capture with nothing left over.
+#[derive(Debug, Clone)]
+pub struct AddSpaceGeometryMapping {
+    pub space_id: u32,
+    /// Identifies this entry so a later removal can name it.
+    pub entry_id: WgSocketAddrV4,
+    /// Resource path, e.g. `"spaces/251_br_battle_city3_hw25"`.
+    pub path: String,
+    /// The placement transform, 16 floats in wire order.
+    ///
+    /// Deliberately not a `Mat4`: the only sample so far is the identity, which cannot
+    /// distinguish row-major from column-major. Interpreting it needs a capture with a
+    /// translation or rotation in it.
+    pub transform: [f32; 16],
+    /// One trailing byte, meaning unknown; `0x01` in the only sample.
+    pub unk: u8,
+    /// Anything beyond the layout above. Always empty if it is right -- kept rather than
+    /// raised as an error so a mismatch reports itself without stopping the bundle, the
+    /// shape having been inferred from a single capture.
+    pub rest: Vec<u8>,
+}
+
+impl SimpleCodec for AddSpaceGeometryMapping {
+
+    fn write(&self, write: &mut dyn Write) -> io::Result<()> {
+        write.write_u32(self.space_id)?;
+        SimpleCodec::write(&self.entry_id, write)?;
+        write.write_string_variable(&self.path)?;
+        for f in &self.transform {
+            write.write_all(&f.to_le_bytes())?;
+        }
+        write.write_u8(self.unk)?;
+        write.write_all(&self.rest)
+    }
+
+    fn read(read: &mut dyn Read) -> io::Result<Self> {
+        let space_id = read.read_u32()?;
+        let entry_id = SimpleCodec::read(read)?;
+        let path = read.read_string_variable_lossy()?;
+        let mut buf = [0u8; 64];
+        read.read_exact(&mut buf)?;
+        let mut transform = [0f32; 16];
+        for (slot, chunk) in transform.iter_mut().zip(buf.chunks_exact(4)) {
+            *slot = f32::from_le_bytes(chunk.try_into().unwrap());
+        }
+        let unk = read.read_u8()?;
+        let mut rest = Vec::new();
+        read.read_to_end(&mut rest)?;
+        Ok(Self { space_id, entry_id, path, transform, unk, rest })
+    }
+
+}
+
+impl SimpleElement for AddSpaceGeometryMapping {
+    const ID: u8 = id::ADD_SPACE_GEOMETRY_MAPPING;
+    const LEN: ElementLength = ElementLength::Variable16;
+}
 pub type RemoveSpaceGeometryMapping = DebugElementVariable16<{ id::REMOVE_SPACE_GEOMETRY_MAPPING }>;
 
 /// Sent from the cell when another entity (not the client's own player) enters its Area
@@ -2562,7 +2632,29 @@ impl Element<[PropertyDef]> for UpdateEntity {
     }
 
 }
-pub type SetCellAppExtAddress = DebugElementVariable16<{ id::SET_CELL_APP_EXT_ADDRESS }>;
+/// Tells the client the CellApp's externally reachable address.
+///
+/// Eight bytes in the only capture so far, decoding through the same [`WgSocketAddrV4`]
+/// codec as [`SwitchBaseApp`] to `185.12.240.49:19111` with salt 0. That address sits in
+/// the same `/24` as every BaseApp this proxy has been handed (`.39`, `.45`, `.69`), and
+/// carries the salt-0 of the other server addresses, which is the evidence for reading
+/// it this way rather than as eight opaque bytes.
+#[derive(Debug, Clone)]
+pub struct SetCellAppExtAddress(pub WgSocketAddrV4);
+
+impl SimpleCodec for SetCellAppExtAddress {
+    fn write(&self, write: &mut dyn Write) -> io::Result<()> {
+        SimpleCodec::write(&self.0, write)
+    }
+    fn read(read: &mut dyn Read) -> io::Result<Self> {
+        SimpleCodec::read(read).map(Self)
+    }
+}
+
+impl SimpleElement for SetCellAppExtAddress {
+    const ID: u8 = id::SET_CELL_APP_EXT_ADDRESS;
+    const LEN: ElementLength = ElementLength::Variable16;
+}
 pub type LastProxyMessageAfterDirectCellAppConnection = DebugElementVariable16<{ id::LAST_PROXY_MESSAGE_AFTER_DIRECT_CELL_APP_CONNECTION }>;
 
 // =============================================================================
@@ -2844,6 +2936,45 @@ mod tests {
     /// relies on for realistic (mostly `Dict`-of-typed-fields) array elements.
     fn const_hex(hex: &str) -> Vec<u8> {
         (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// [`AddSpaceGeometryMapping`] against bytes taken verbatim off the wire.
+    ///
+    /// The whole case for this layout is that it accounts for all 109 bytes exactly --
+    /// `4 + 8 + 1 + 31 + 64 + 1` -- so the test asserts an empty `rest` as much as it
+    /// asserts the fields. The `entry_id` decoding to a sane internal address, rather
+    /// than noise, is the other half of the evidence.
+    #[test]
+    fn add_space_geometry_mapping_from_a_live_capture() {
+
+        let data = const_hex(concat!(
+            "de100000",                       // space 4318
+            "0a930831401f0900",               // entry id: 10.147.8.49:16415 salt 9
+            "1f",                             // path length, 31
+            "7370616365732f3235315f62725f626174746c655f63697479335f68773235",
+            // transform: identity, 16 little-endian f32
+            "0000803f000000000000000000000000",
+            "000000000000803f0000000000000000",
+            "00000000000000000000803f00000000",
+            "0000000000000000000000000000803f",
+            "01",                             // trailing byte
+        ));
+        assert_eq!(data.len(), 109, "the capture was 109 bytes");
+
+        let m = <AddSpaceGeometryMapping as SimpleCodec>::read(&mut &data[..]).unwrap();
+
+        assert_eq!(m.space_id, 4318);
+        assert_eq!(m.entry_id.to_string(), "10.147.8.49:16415");
+        assert_eq!(m.path, "spaces/251_br_battle_city3_hw25");
+        assert_eq!(m.transform, [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ]);
+        assert_eq!(m.unk, 1);
+        assert!(m.rest.is_empty(), "the layout must consume the payload exactly: {:?}", m.rest);
+
     }
 
     /// `CreateEntity` must consume *four* bytes of direction, not three, or `client_data`

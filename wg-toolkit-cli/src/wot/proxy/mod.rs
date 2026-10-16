@@ -127,6 +127,32 @@ macro_rules! trace_dbg {
     }};
 }
 
+/// Like [`trace_dbg`], but for elements that still have no real codec: logs the body at
+/// INFO so samples accumulate in the session logs rather than vanishing at TRACE.
+///
+/// Most of these have never been seen on the wire at all, and the ones that have appear
+/// one to three times a session -- far too sparse to work out a layout from a single
+/// capture, and easy to miss entirely if they only log at TRACE. Surfacing them means a
+/// corpus builds up across sessions for free, which is how `CreateEntity`'s alignment and
+/// the NRL tick were both cracked.
+///
+/// Capped per element id so that one of these turning out to be high-rate (several are
+/// named "periodic" or "heartbeat") cannot drown the log: past the cap it falls back to
+/// TRACE. The census still counts every one, so the cap never hides how often it fires.
+macro_rules! sample_dbg {
+    ($self:expr, $elt:expr, $addr:expr, $ty:ty) => {{
+        let e = $elt.read_simple::<$ty>()?;
+        if $self.sample_budget(<$ty as SimpleElement>::ID) {
+            info!(addr = %$addr, id = <$ty as SimpleElement>::ID, request_id = ?e.request_id,
+                "UNDECODED {}: {:?}", stringify!($ty), e.element);
+        } else {
+            trace!(addr = %$addr, id = <$ty as SimpleElement>::ID, request_id = ?e.request_id,
+                "{}: {:?}", stringify!($ty), e.element);
+        }
+        Ok(true)
+    }};
+}
+
 /// Like [`trace_dbg`], but for the `AVATAR_UPDATE_NO_ALIAS_*` (AVUPMSG) family and
 /// `AvatarUpdateNoAliasDetailed`, which carry a full `entity_id`.
 ///
@@ -246,6 +272,7 @@ pub fn run(
         census_out: HashMap::new(),
         census_pending: 0,
         base_login_seen: HashSet::new(),
+        sample_counts: HashMap::new(),
     };
 
     thread::scope(move |scope| {
@@ -558,6 +585,8 @@ struct BaseHandler {
     /// pairing by request id is impossible. See
     /// [`wgtk::app::base::element::BaseAppLoginReply`].
     base_login_seen: HashSet<SocketAddr>,
+    /// How many bodies have been surfaced at INFO per element id, for [`sample_dbg`]'s cap.
+    sample_counts: HashMap<u8, u32>,
 }
 
 #[derive(Debug)]
@@ -727,6 +756,16 @@ impl proxy::Handler for BaseHandler {
 }
 
 impl BaseHandler {
+
+    /// Whether this element id still has room to have a body logged at INFO.
+    ///
+    /// Twenty samples is far more than enough to recover a layout, and well short of
+    /// anything that would bury the rest of the log.
+    fn sample_budget(&mut self, id: u8) -> bool {
+        let seen = self.sample_counts.entry(id).or_insert(0);
+        *seen += 1;
+        *seen <= 20
+    }
 
     /// Tally one element id, and periodically log the running census.
     ///
@@ -973,7 +1012,7 @@ impl BaseHandler {
             // live against v2.3.1.3, see `re-work/NOTES.md`) but not yet given a proper
             // structured codec -- read them through their placeholder type so the bundle
             // can safely keep being read, and trace their raw content.
-            PingDatacenter::ID => return trace_dbg!(elt, addr, PingDatacenter),
+            PingDatacenter::ID => return sample_dbg!(self, elt, addr, PingDatacenter),
             AvatarUpdateImplicit::ID => {
                 // The client stamps each of its own outgoing positions with a sequence
                 // number and remembers it (`sentPositions_[seq] = globalPos`); the server
@@ -1022,10 +1061,10 @@ impl BaseHandler {
                     "-> Nrl msg to cell: {:?}", stream.messages);
                 return Ok(true);
             }
-            AvatarUpdateWardImplicit::ID => return trace_dbg!(elt, addr, AvatarUpdateWardImplicit),
-            AvatarUpdateWardExplicit::ID => return trace_dbg!(elt, addr, AvatarUpdateWardExplicit),
-            AckWardPhysicsCorrection::ID => return trace_dbg!(elt, addr, AckWardPhysicsCorrection),
-            RestoreClientAck::ID => return trace_dbg!(elt, addr, RestoreClientAck),
+            AvatarUpdateWardImplicit::ID => return sample_dbg!(self, elt, addr, AvatarUpdateWardImplicit),
+            AvatarUpdateWardExplicit::ID => return sample_dbg!(self, elt, addr, AvatarUpdateWardExplicit),
+            AckWardPhysicsCorrection::ID => return sample_dbg!(self, elt, addr, AckWardPhysicsCorrection),
+            RestoreClientAck::ID => return sample_dbg!(self, elt, addr, RestoreClientAck),
             ClientToServerHeartbeat::ID => return trace_dbg!(elt, addr, ClientToServerHeartbeat),
             SendToCell::ID => return trace_dbg!(elt, addr, SendToCell),
             id if id::BASE_ENTITY_METHOD.contains(id) => {
@@ -1517,10 +1556,19 @@ impl BaseHandler {
             Authenticate::ID => return trace_dbg!(elt, addr, Authenticate),
             BandwidthNotification::ID => return trace_dbg!(elt, addr, BandwidthNotification),
             SetGameTime::ID => return trace_dbg!(elt, addr, SetGameTime),
-            DummyPacket::ID => return trace_dbg!(elt, addr, DummyPacket),
-            SpaceProperty::ID => return trace_dbg!(elt, addr, SpaceProperty),
-            AddSpaceGeometryMapping::ID => return trace_dbg!(elt, addr, AddSpaceGeometryMapping),
-            RemoveSpaceGeometryMapping::ID => return trace_dbg!(elt, addr, RemoveSpaceGeometryMapping),
+            DummyPacket::ID => return sample_dbg!(self, elt, addr, DummyPacket),
+            SpaceProperty::ID => return sample_dbg!(self, elt, addr, SpaceProperty),
+            AddSpaceGeometryMapping::ID => {
+                // INFO while the layout is on probation -- it was recovered from a single
+                // capture. `rest` empty across sessions is what confirms it.
+                let e = elt.read_simple::<AddSpaceGeometryMapping>()?;
+                let m = &e.element;
+                info!(%addr, id = AddSpaceGeometryMapping::ID, rest = %hex(&m.rest),
+                    "<- Add space geometry mapping: space {} entry {} {:?} unk={} transform={:?}",
+                    m.space_id, m.entry_id, m.path, m.unk, m.transform);
+                return Ok(true);
+            }
+            RemoveSpaceGeometryMapping::ID => return sample_dbg!(self, elt, addr, RemoveSpaceGeometryMapping),
             CreateEntity::ID => {
                 // Record the entity's type so a later `SelectEntity` targeting it can
                 // resolve a dispatch table. Without this, only the player's own base
@@ -1614,7 +1662,7 @@ impl BaseHandler {
                     e.element.entity_id, stale);
                 return Ok(true);
             }
-            TickSyncPeriodic::ID => return trace_dbg!(elt, addr, TickSyncPeriodic),
+            TickSyncPeriodic::ID => return sample_dbg!(self, elt, addr, TickSyncPeriodic),
             RelativePositionReference::ID => {
                 let e = elt.read_simple::<RelativePositionReference>()?;
                 let seq = e.element.sequence_number;
@@ -1730,8 +1778,8 @@ impl BaseHandler {
             AvatarUpdateAliasNoPosYawPitch::ID => return trace_dbg_alias!(self, elt, addr, AvatarUpdateAliasNoPosYawPitch),
             AvatarUpdateAliasNoPosYaw::ID => return trace_dbg_alias!(self, elt, addr, AvatarUpdateAliasNoPosYaw),
             AvatarUpdateAliasNoPosNoDir::ID => return trace_dbg_alias!(self, elt, addr, AvatarUpdateAliasNoPosNoDir),
-            AvatarUpdateVolatileProperties::ID => return trace_dbg!(elt, addr, AvatarUpdateVolatileProperties),
-            ChangeVolatilePackerType::ID => return trace_dbg!(elt, addr, ChangeVolatilePackerType),
+            AvatarUpdateVolatileProperties::ID => return sample_dbg!(self, elt, addr, AvatarUpdateVolatileProperties),
+            ChangeVolatilePackerType::ID => return sample_dbg!(self, elt, addr, ChangeVolatilePackerType),
             NrlCreateNode::ID => return trace_dbg!(elt, addr, NrlCreateNode),
             NrlUnlinkTree::ID => return trace_dbg!(elt, addr, NrlUnlinkTree),
             NrlUpdateNode::ID => return trace_dbg!(elt, addr, NrlUpdateNode),
@@ -1741,8 +1789,8 @@ impl BaseHandler {
             NrlMsgToClient::ID => return trace_dbg!(elt, addr, NrlMsgToClient),
             NrlUnreliableMsgToClient::ID => return trace_dbg!(elt, addr, NrlUnreliableMsgToClient),
             ControlEntity::ID => return trace_dbg!(elt, addr, ControlEntity),
-            VoiceData::ID => return trace_dbg!(elt, addr, VoiceData),
-            RestoreClient::ID => return trace_dbg!(elt, addr, RestoreClient),
+            VoiceData::ID => return sample_dbg!(self, elt, addr, VoiceData),
+            RestoreClient::ID => return sample_dbg!(self, elt, addr, RestoreClient),
             DetailedPosition::ID => {
                 // Carries no id of its own -- it applies to the currently-selected entity,
                 // which is also what `ServerConnection::detailedPosition` uses
@@ -1874,8 +1922,13 @@ impl BaseHandler {
                 return Ok(true);
 
             }
-            SetCellAppExtAddress::ID => return trace_dbg!(elt, addr, SetCellAppExtAddress),
-            LastProxyMessageAfterDirectCellAppConnection::ID => return trace_dbg!(elt, addr, LastProxyMessageAfterDirectCellAppConnection),
+            SetCellAppExtAddress::ID => {
+                let e = elt.read_simple::<SetCellAppExtAddress>()?;
+                info!(%addr, id = SetCellAppExtAddress::ID,
+                    "<- Set cell app ext address: {}", e.element.0);
+                return Ok(true);
+            }
+            LastProxyMessageAfterDirectCellAppConnection::ID => return sample_dbg!(self, elt, addr, LastProxyMessageAfterDirectCellAppConnection),
             id if id::ENTITY_METHOD.contains(id) => {
 
                 // Account::msg#37 = onClanInfoReceived
