@@ -59,3 +59,29 @@ tables), and that error is propagated with `?`, using the same rollback-and-retu
 pattern as the rest of the function. A panic there would end the `base` app's forwarding
 thread for good, since nothing in `wg-toolkit-cli/src/main.rs` restarts it, and all
 base-app traffic would stop for the rest of the process.
+
+## Capturing a session and replaying it
+
+With `--capture <file>`, the proxy records every base app packet it receives, in both
+directions, to a gzip-compressed capture (`app/proxy/capture.rs` documents the layout).
+Packets are stored decrypted, before any handler sees them, so a capture holds
+everything needed to decode the session again without its keys. The one packet per
+connection that cannot be decrypted, the client's `baseAppLogin`, is stored as received
+and flagged as such. The login app is not captured: its traffic is only the RSA login
+exchange.
+
+```sh
+wgtk wot <game-dir> --real-login-app <addr> --real-pub-key-path <key> --capture session.wgcap
+wgtk wot <game-dir> --replay session.wgcap
+```
+
+`--replay` feeds the capture through `app::proxy::replay` to the same `BaseHandler` the
+live proxy uses, so it logs the same lines, to the console and to `replay-trace.jsonl`.
+Changing a codec and replaying a capture shows the effect of the change on a whole
+session, without going back in game. Nothing is sent during a replay. Timings
+the handler measures itself, such as how long a command took to be answered, reflect
+the replay's speed rather than the session's; the capture keeps each packet's time.
+
+The capture is flushed every second while packets flow, and whenever the proxy has been
+idle for a few seconds, so stopping the proxy loses at most the last second of traffic.
+A capture cut short this way replays up to its last complete record, with a warning.

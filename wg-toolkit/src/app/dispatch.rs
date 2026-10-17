@@ -9,16 +9,16 @@
 //! stable-sort rule), just reimplemented here at runtime instead of requiring a
 //! per-game generated Rust type ahead of time.
 
-use std::io::{self, Read, Write};
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Read, Write};
 use std::sync::Arc;
 
-use crate::net::element::ElementLength;
-use crate::net::codec::Codec;
 use crate::script::{
     Script, Interface, Method, Property, PropertyFlags, VariableHeaderSize, Component,
     Ty, TyKind, TyDict, TyDictProp, TySystem, Value,
 };
+use crate::net::element::ElementLength;
+use crate::net::codec::Codec;
 
 
 /// Every entity's dynamic dispatch tables, computed once from a loaded [`Script`] --

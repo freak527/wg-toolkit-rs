@@ -1,11 +1,11 @@
 //! Provides various internal utilities.
 
-use std::fmt::{self, Write};
-
 pub mod io;
 pub mod fnv;
 pub mod cuckoo;
 pub mod thread;
+
+use std::fmt::{self, Write};
 
 
 /// A helper structure for pretty printing of bytes. It provides format implementations 

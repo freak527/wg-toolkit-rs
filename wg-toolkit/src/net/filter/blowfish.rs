@@ -1,7 +1,7 @@
 //! Blowfish symmetric encryption filter.
 
-use std::io::{self, Read, Write};
 use std::ops::{BitXorAssign, BitXor};
+use std::io::{self, Read, Write};
 
 use blowfish::cipher::{BlockEncrypt, BlockDecrypt, Block};
 use blowfish::Blowfish;

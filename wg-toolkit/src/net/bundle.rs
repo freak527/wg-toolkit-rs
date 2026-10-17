@@ -5,13 +5,13 @@ use std::fmt;
 
 use tracing::warn;
 
-use super::packet::{self, PacketConfig, PacketLocked, Packet};
-use super::element::{Element, Reply, REPLY_ID};
-use super::codec::Codec;
-
 use crate::util::io::{WgReadExt, WgWriteExt, IoCounter};
 use crate::net::element::ElementLength;
 use crate::util::AsciiFmt;
+
+use super::packet::{self, PacketConfig, PacketLocked, Packet};
+use super::element::{Element, Reply, REPLY_ID};
+use super::codec::Codec;
 
 
 /// The maximum length for writing bundle elements, it's basically the packet capacity 

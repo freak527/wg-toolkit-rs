@@ -8,14 +8,14 @@
 //!
 //! usage: <res-dir> <entity> <hex> [<hex>...]
 
-use std::env;
 use std::path::Path;
+use std::env;
 
-use wgtk::res::fs::ResFilesystem;
-use wgtk::script;
-use wgtk::app::dispatch::ScriptDispatch;
 use wgtk::app::client::element::UpdateEntity;
+use wgtk::app::dispatch::ScriptDispatch;
+use wgtk::res::fs::ResFilesystem;
 use wgtk::net::element::Element;
+use wgtk::script;
 
 fn main() {
     let mut args = env::args().skip(1);

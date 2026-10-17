@@ -12,16 +12,15 @@ use std::io;
 use crypto_common::KeyInit;
 use rsa::RsaPrivateKey;
 use blowfish::Blowfish;
-
 use rand::rngs::OsRng;
-use rand::RngCore;
-
 use tracing::trace;
+use rand::RngCore;
 
 use crate::net::bundle::{Bundle, NextElementReader, ElementReader};
 use crate::util::cuckoo::CuckooContext;
 use crate::net::socket::PacketSocket;
 use crate::net::proto::Protocol;
+
 use super::io_invalid_data;
 
 use element::{

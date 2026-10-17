@@ -2,20 +2,18 @@
 
 pub mod proxy;
 pub mod emulator;
+pub mod account_commands;
 
 use std::sync::Arc;
+use std::fs::File;
 use std::fs;
 
-use std::fs::File;
-
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
-use rsa::{RsaPrivateKey, RsaPublicKey};
-
-use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{EnvFilter, Layer};
-use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::{EnvFilter, Layer};
+use tracing::level_filters::LevelFilter;
+use rsa::{RsaPrivateKey, RsaPublicKey};
 use wgtk::res::fs::ResFilesystem;
 use wgtk::script::{self, Script};
 
@@ -50,7 +48,8 @@ pub fn cmd_wot(args: WotArgs) -> CliResult<()> {
     // internal packet/channel transport bookkeeping (sequence numbers, acks, fragment
     // reassembly, ...), not application-level protocol content -- it'd drown out the
     // actually useful element-level events in the trace file.
-    let trace_path = "proxy-trace.jsonl";
+    // A replay gets its own trace file, so it never overwrites the live session's.
+    let trace_path = if args.replay.is_some() { "replay-trace.jsonl" } else { "proxy-trace.jsonl" };
     let trace_file = File::create(trace_path)
         .map_err(|e| format!("Failed to create trace file at {trace_path}: {e}"))?;
 
@@ -66,6 +65,10 @@ pub fn cmd_wot(args: WotArgs) -> CliResult<()> {
         .init();
 
     let script = load_script(&args.dir)?;
+
+    if let Some(replay_path) = args.replay.as_deref() {
+        return proxy::replay(replay_path, args.real_login_app, script);
+    }
 
     // Start by decoding the private key...
     let encryption_key;
@@ -98,7 +101,8 @@ pub fn cmd_wot(args: WotArgs) -> CliResult<()> {
             real_encryption_key = None;
         }
         
-        proxy::run(args.login_app, real_login_app, args.base_app, encryption_key, real_encryption_key, script)
+        proxy::run(args.login_app, real_login_app, args.base_app, encryption_key, real_encryption_key, script,
+            args.capture.as_deref())
 
     } else {
         emulator::run(args.login_app, args.base_app, encryption_key, script)

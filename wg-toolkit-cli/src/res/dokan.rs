@@ -5,18 +5,15 @@ use std::sync::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use winapi::shared::ntstatus;
-use winapi::um::winnt;
-
 use dokan::{
     CreateFileInfo, DiskSpaceInfo, FileInfo, FileSystemHandler, FileSystemMounter,
     FillDataError, FillDataResult, FindData, MountOptions, OperationInfo, OperationResult,
     VolumeInfo
 };
-
-use widestring::{U16CStr, U16CString};
-
 use wgtk::res::fs::{ResFilesystem, ResReadDir, ResReadFile};
+use widestring::{U16CStr, U16CString};
+use winapi::shared::ntstatus;
+use winapi::um::winnt;
 
 use crate::{CliOptions, CliResult, ResDokanArgs};
 

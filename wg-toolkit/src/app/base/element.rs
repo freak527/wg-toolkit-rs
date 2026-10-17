@@ -7,12 +7,12 @@ use std::io::{self, Read, Write};
 
 use glam::Vec3;
 
-use crate::net::element::{DebugElementFixed, DebugElementVariable16, ElementLength, Element, SimpleElement};
-use crate::util::io::WgReadExt;
+use crate::net::element::{DebugElementFixed, ElementLength, Element, SimpleElement};
 use crate::app::dispatch::{MethodDef, MethodCall};
-use crate::app::math::PackedYawPitchRoll;
 use crate::app::client::element::NrlStream;
+use crate::app::math::PackedYawPitchRoll;
 use crate::net::codec::SimpleCodec;
+use crate::util::io::WgReadExt;
 
 
 /// Internal module containing all raw elements numerical ids.

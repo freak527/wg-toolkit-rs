@@ -67,6 +67,25 @@ impl fmt::Debug for Value {
     }
 }
 
+impl Value {
+
+    /// The value as an integer, for any of the integer variants whose value fits an `i64`.
+    pub fn as_i64(&self) -> Option<i64> {
+        match *self {
+            Value::Int8(v) => Some(v.into()),
+            Value::Int16(v) => Some(v.into()),
+            Value::Int32(v) => Some(v.into()),
+            Value::Int64(v) => Some(v),
+            Value::UInt8(v) => Some(v.into()),
+            Value::UInt16(v) => Some(v.into()),
+            Value::UInt32(v) => Some(v.into()),
+            Value::UInt64(v) => i64::try_from(v).ok(),
+            _ => None,
+        }
+    }
+
+}
+
 /// The string data type used by default for all STRING types.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StringValue {

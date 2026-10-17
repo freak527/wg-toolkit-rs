@@ -7,13 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use tracing::{info, instrument, warn};
-
 use rsa::rand_core::{OsRng, RngCore};
-use rsa::RsaPrivateKey;
-use blowfish::Blowfish;
-
 use wgtk::app::{login, base};
 use wgtk::script::Script;
+use rsa::RsaPrivateKey;
+use blowfish::Blowfish;
 
 use crate::CliResult;
 

@@ -1,10 +1,10 @@
-use std::env;
 use std::path::Path;
+use std::env;
 
-use wgtk::res::fs::ResFilesystem;
-use wgtk::script;
 use wgtk::app::dispatch::ScriptDispatch;
+use wgtk::res::fs::ResFilesystem;
 use wgtk::script::{Ty, TyKind};
+use wgtk::script;
 
 fn ty_json(ty: &Ty) -> String {
     match ty.kind() {

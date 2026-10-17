@@ -1,16 +1,15 @@
 //! FUSE implementation for game resources.
 
-use std::io::{self, Read, Seek};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex, RwLock};
+use std::io::{self, Read, Seek};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 
 use fuser::{AccessFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, 
     FopenFlags, Generation, INodeNo, MountOption, OpenAccMode, OpenFlags, ReplyAttr, 
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request};
-
 use wgtk::res::fs::{ResFilesystem, ResReadDir, ResReadFile, ResStat};
 
 use crate::{CliOptions, CliResult, ResFuseArgs};

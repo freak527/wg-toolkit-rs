@@ -3,15 +3,15 @@
 //! to find exactly where a live decode desync started -- without needing a fresh game
 //! session.
 
-use std::env;
 use std::path::Path;
+use std::env;
 
-use wgtk::res::fs::ResFilesystem;
-use wgtk::script;
-use wgtk::app::dispatch::ScriptDispatch;
-use wgtk::app::client::element as client_el;
 use wgtk::net::bundle::{Bundle, NextElementReader};
+use wgtk::app::client::element as client_el;
+use wgtk::app::dispatch::ScriptDispatch;
+use wgtk::res::fs::ResFilesystem;
 use wgtk::net::packet::Packet;
+use wgtk::script;
 
 fn main() {
     let dir = env::args().nth(1).expect("usage: <game-dir> <entity-name> <hex-packet>");

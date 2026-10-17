@@ -1,12 +1,12 @@
 //! Dump an entity's client-visible property table in exposed-id order, with the stream
 //! length each slot was assigned, to check the table's ordering against the wire.
 
-use std::env;
 use std::path::Path;
+use std::env;
 
+use wgtk::app::dispatch::ScriptDispatch;
 use wgtk::res::fs::ResFilesystem;
 use wgtk::script;
-use wgtk::app::dispatch::ScriptDispatch;
 
 fn main() {
     let dir = env::args().nth(1).expect("usage: <game-dir> <entity>");

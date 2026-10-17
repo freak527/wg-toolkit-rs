@@ -3,8 +3,8 @@
 //!
 //! Usage: cargo run -p wg-toolkit-cli --features wot --example dump_component_ids -- <game-dir> [id...]
 
-use std::env;
 use std::path::Path;
+use std::env;
 
 use wgtk::res::fs::ResFilesystem;
 use wgtk::script;

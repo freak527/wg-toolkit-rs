@@ -1,17 +1,16 @@
 //! The CLI for wg-toolkit library.
 
+mod pxml;
+mod res;
+#[cfg(feature = "wot")]
+mod wot;
+
 use std::io::{self, IsTerminal};
 use std::net::SocketAddrV4;
 use std::process::ExitCode;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-
-mod pxml;
-mod res;
-
-#[cfg(feature = "wot")]
-mod wot;
 
 
 /// Global options for the command line interface.
@@ -214,6 +213,15 @@ pub struct WotArgs {
     pub real_login_app: Option<SocketAddrV4>,
     #[arg(long, requires = "real_login_app")]
     pub real_pub_key_path: Option<PathBuf>,
+    /// In proxy mode, record every base app packet to this file, as a gzip-compressed
+    /// capture of the decrypted packets, for later analysis with `--replay`.
+    #[arg(long, requires = "real_login_app", conflicts_with = "replay")]
+    pub capture: Option<PathBuf>,
+    /// Decode a capture recorded with `--capture` instead of running a server, logging
+    /// exactly what the proxy logged live. Give `--real-login-app` too if the capture's
+    /// first packet does not come from the same network as the real login app.
+    #[arg(long)]
+    pub replay: Option<PathBuf>,
 }
 
 /// Type alias for a result that simply returns a string on error, this will be output

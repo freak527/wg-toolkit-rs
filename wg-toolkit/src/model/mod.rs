@@ -1,11 +1,11 @@
 //! Compiled model memory representation, encoding and decoding.
 
+pub mod primitive;
+pub mod visual;
+
 use std::io::{Read, Seek};
 
 use thiserror::Error;
-
-pub mod primitive;
-pub mod visual;
 
 use primitive::{PrimitiveReader, Vertices, Indices, Vertex, Primitive, Group};
 use visual::{Visual, RenderSet};

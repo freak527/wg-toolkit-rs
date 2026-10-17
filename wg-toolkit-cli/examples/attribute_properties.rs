@@ -5,12 +5,12 @@
 //! Usage: <game-dir> <entity> <ground-truth-file>
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::env;
 use std::fs;
-use std::path::Path;
 
-use wgtk::res::fs::ResFilesystem;
 use wgtk::script::{self, Interface, PropertyFlags, Script};
+use wgtk::res::fs::ResFilesystem;
 
 fn exposed(flags: PropertyFlags) -> bool {
     matches!(flags, PropertyFlags::AllClients | PropertyFlags::OwnClient | PropertyFlags::BaseAndClient)

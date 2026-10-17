@@ -1,14 +1,13 @@
 //! Compiled space sections structures definitions.
 
-use std::io::{self, Read, Seek};
-
-
 mod bwtb;
 mod bwst;
 mod bwal;
 mod bwcs;
 mod bwsg;
 mod bwt2;
+
+use std::io::{self, Read, Seek};
 
 pub use bwtb::*;
 pub use bwst::*;

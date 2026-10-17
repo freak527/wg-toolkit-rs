@@ -2,21 +2,20 @@
 //! once connected to the base application..
 
 use std::io::{self, Read, Write};
-use std::borrow::Cow;
 use std::collections::HashMap;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::fmt;
 
+use tracing::warn;
 use glam::Vec3;
 
-use tracing::warn;
-
 use crate::net::element::{DebugElementFixed, DebugElementVariable16, ElementLength, Element, SimpleElement};
-use crate::app::bit::BitReader;
 use crate::app::dispatch::{ScriptDispatch, EntityDispatch, MethodDef, PropertyDef, MethodCall};
 use crate::util::io::{WgReadExt, WgWriteExt, serde_pickle_de_options};
 use crate::net::codec::{Codec, SimpleCodec, WgSocketAddrV4};
 use crate::script::{Ty, TyKind, TyDict, Value, PythonValue};
+use crate::app::bit::BitReader;
 use crate::util::AsciiFmt;
 
 pub use crate::app::math::{PackedXyz, PackedXz, PackedYawPitch, PackedYawPitchRoll, PackedYaw};

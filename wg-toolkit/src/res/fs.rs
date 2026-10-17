@@ -1,12 +1,12 @@
 //! Virtual read-only filesystem for browsing and reading the game's resources.
 
-use core::fmt;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::fs::{File, ReadDir};
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use std::{fs, io};
+use core::fmt;
 
 use indexmap::IndexMap;
 

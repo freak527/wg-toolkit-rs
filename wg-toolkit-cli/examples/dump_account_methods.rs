@@ -1,10 +1,10 @@
-use std::env;
 use std::path::Path;
+use std::env;
 
-use wgtk::res::fs::ResFilesystem;
-use wgtk::script;
 use wgtk::app::dispatch::ScriptDispatch;
 use wgtk::app::client::element::id;
+use wgtk::res::fs::ResFilesystem;
+use wgtk::script;
 
 fn main() {
     let dir = env::args().nth(1).expect("usage: <game-dir>");

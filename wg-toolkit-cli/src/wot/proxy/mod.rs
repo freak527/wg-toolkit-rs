@@ -1,32 +1,36 @@
 //! Proxy login and base app used for debugging exchanged messages.
 
-use std::net::{IpAddr, SocketAddr, SocketAddrV4};
+mod python;
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{io, thread};
-
-use tracing::{debug, error, info, warn, info_span, trace, trace_span};
-
-use rsa::{RsaPrivateKey, RsaPublicKey};
-use flate2::read::ZlibDecoder;
-use blowfish::Blowfish;
+use std::path::Path;
 
 use wgtk::net::element::{DebugElementUndefined, DebugElementVariable16, DebugElementVariable32, SimpleElement, REPLY_ID};
-use wgtk::net::bundle::{Bundle, NextElementReader, ElementReader};
-use wgtk::net::codec::WgSocketAddrV4;
-
-use wgtk::app::{proxy, login_proxy, base, client};
 use wgtk::app::dispatch::{ScriptDispatch, MethodCall, MethodDef, PropertyDef};
 use wgtk::app::math::{PackedXyz, PackedXz, calculate_reference_position};
-use glam::Vec3;
+use tracing::{debug, error, info, warn, info_span, trace, trace_span};
 use wgtk::app::base::element::{CellMethodTables, BaseAppLoginReply};
-use wgtk::net::packet::Packet;
-use wgtk::script::{Script, Value};
-
+use wgtk::net::bundle::{Bundle, NextElementReader, ElementReader};
+use wgtk::app::proxy::capture::{CaptureReader, CaptureWriter};
+use wgtk::app::{proxy, login_proxy, base, client};
 use wgtk::util::io::serde_pickle_de_options;
+use rsa::{RsaPrivateKey, RsaPublicKey};
+use wgtk::net::codec::WgSocketAddrV4;
+use wgtk::script::{Script, Value};
+use flate2::read::ZlibDecoder;
+use wgtk::net::packet::Packet;
+use blowfish::Blowfish;
+use glam::Vec3;
 
 use crate::CliResult;
+
+/// Tracing target for the Python-level descriptions (see [`python`]), so they can be
+/// filtered on their own: `RUST_LOG=wgtk::wot::python=info`.
+const PYTHON_TARGET: &str = "wgtk::wot::python";
 
 
 /// Sentinel `id_alias` value meaning "no alias assigned" -- confirmed against the leaked
@@ -89,26 +93,6 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
-}
-
-/// Append every inbound packet to `$WGTK_DUMP_PACKETS`, when set. Opened once, lazily;
-/// any I/O error disables the dump rather than disturbing the proxy.
-fn dump_packets(raw: &[String]) {
-    use std::io::Write as _;
-    use std::sync::{Mutex, OnceLock};
-    static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-    let sink = SINK.get_or_init(|| {
-        let path = std::env::var("WGTK_DUMP_PACKETS").ok()?;
-        match std::fs::File::create(&path) {
-            Ok(f) => Some(Mutex::new(f)),
-            Err(e) => { warn!("failed to open WGTK_DUMP_PACKETS={path}: {e}"); None }
-        }
-    });
-    if let Some(sink) = sink {
-        if let Ok(mut f) = sink.lock() {
-            for p in raw { let _ = writeln!(f, "{p}"); }
-        }
-    }
 }
 
 /// Read an element as `$ty` and log it at TRACE, with structured `id`/`request_id`
@@ -225,6 +209,7 @@ pub fn run(
     encryption_key: Option<Arc<RsaPrivateKey>>,
     real_encryption_key: Option<Arc<RsaPublicKey>>,
     script: Script,
+    capture_path: Option<&Path>,
 ) -> CliResult<()> {
 
     let mut login_app = login_proxy::App::new(login_app_addr.into(), real_login_app_addr.into(), real_encryption_key)
@@ -236,6 +221,13 @@ pub fn run(
 
     let mut base_app = proxy::App::new(base_app_addr.into())
         .map_err(|e| format!("Failed to bind base app: {e}"))?;
+
+    if let Some(capture_path) = capture_path {
+        let capture = CaptureWriter::create(capture_path)
+            .map_err(|e| format!("Failed to create packet capture at {}: {e}", capture_path.display()))?;
+        base_app.set_capture(capture);
+        info!("Capturing base app packets to {}", capture_path.display());
+    }
 
     let shared = Arc::new(Shared {
         base_app_addr,
@@ -250,26 +242,7 @@ pub fn run(
         shared: Arc::clone(&shared),
     };
 
-    let base_handler = BaseHandler {
-        shared,
-        next_tick: None,
-        entities: HashMap::new(),
-        created_entity_types: HashMap::new(),
-        selected_entity_id: None,
-        player_entity_id: None,
-        id_aliases: HashMap::new(),
-        warned_aliases: HashSet::new(),
-        avup_samples: HashMap::new(),
-        partial_resources: HashMap::new(),
-        session_keys: HashMap::new(),
-        position: PositionTracker::new(),
-        entity_properties: HashMap::new(),
-        census_in: HashMap::new(),
-        census_out: HashMap::new(),
-        census_pending: 0,
-        base_login_seen: HashSet::new(),
-        sample_counts: HashMap::new(),
-    };
+    let base_handler = BaseHandler::new(shared);
 
     thread::scope(move |scope| {
 
@@ -288,6 +261,60 @@ pub fn run(
         });
 
     });
+
+    Ok(())
+
+}
+
+/// Decode a packet capture written by [`run`] offline, through the same handler, so it
+/// logs exactly what the live proxy would have.
+///
+/// The real login app address only serves the sanity check on `SwitchBaseApp`
+/// addresses; when not given, the real address of the first captured packet stands in
+/// for it, being a base app of the same network.
+pub fn replay(
+    capture_path: &Path,
+    real_login_app_addr: Option<SocketAddrV4>,
+    script: Script,
+) -> CliResult<()> {
+
+    let open = || CaptureReader::open(capture_path)
+        .map_err(|e| format!("Failed to open packet capture at {}: {e}", capture_path.display()));
+
+    let real_login_app_addr = match real_login_app_addr {
+        Some(addr) => addr,
+        None => match open()?.next() {
+            Some(Ok(record)) => match record.real_addr {
+                SocketAddr::V4(addr) => addr,
+                SocketAddr::V6(addr) => return Err(format!("Unexpected IPv6 real address {addr}, give the real login app address")),
+            },
+            Some(Err(e)) => return Err(format!("Failed to read packet capture: {e}")),
+            None => return Err(format!("The packet capture is empty")),
+        },
+    };
+
+    let capture = open()?;
+    info!("Replaying packet capture {}, recorded at Unix time {}s",
+        capture_path.display(), capture.start_unix().as_secs());
+
+    let unspecified = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+    let mut handler = BaseHandler::new(Arc::new(Shared {
+        base_app_addr: unspecified,
+        login_app_addr: unspecified,
+        real_login_app_addr,
+        dispatch: ScriptDispatch::new(script),
+        pending_clients: Mutex::new(HashMap::new()),
+        pending_switches: Mutex::new(HashMap::new()),
+    }));
+
+    let _span = info_span!("base").entered();
+    let truncated = proxy::replay(capture, &mut handler)
+        .map_err(|e| format!("Failed to replay packet capture: {e}"))?;
+
+    if truncated {
+        warn!("The packet capture ends on an incomplete record, it was not finished properly");
+    }
+    info!("Replay complete");
 
     Ok(())
 
@@ -556,6 +583,9 @@ struct BaseHandler {
     /// decoded by a `DebugElement*` placeholder is only a work list next to how much
     /// traffic each one actually carries, and `trace_dbg!` logs at TRACE, so an
     /// INFO-level session otherwise says nothing about them. See [`Self::count_element`].
+    /// The Python-level view of account commands, tokens and streams: see
+    /// [`python::Requests`].
+    requests: python::Requests,
     census_in: HashMap<u8, u32>,
     census_out: HashMap<u8, u32>,
     census_pending: u32,
@@ -733,12 +763,6 @@ impl proxy::Handler for BaseHandler {
                 // returns an error, the `ElementReader` has already consumed part of it,
                 // and nothing else exposes the pre-parse bytes.
                 let raw: Vec<String> = bundle.iter().map(|p| hex(p.slice())).collect();
-                // Optional full-corpus capture: the error path below only ever preserves
-                // the handful of bundles that failed, which is far too sparse to replay
-                // offline -- the selection/alias state machine needs every packet in order
-                // to be meaningful. Set `WGTK_DUMP_PACKETS=<file>` to append every inbound
-                // packet (one hex line each) for `examples/replay_selection.rs`.
-                dump_packets(&raw);
                 if let Err(e) = self.read_in_bundle(peer, bundle) {
                     error!(%addr, raw_packets = ?raw, "<- Error while reading bundle: {e}");
                 }
@@ -752,6 +776,30 @@ impl proxy::Handler for BaseHandler {
 }
 
 impl BaseHandler {
+
+    fn new(shared: Arc<Shared>) -> Self {
+        Self {
+            shared,
+            next_tick: None,
+            entities: HashMap::new(),
+            created_entity_types: HashMap::new(),
+            selected_entity_id: None,
+            player_entity_id: None,
+            id_aliases: HashMap::new(),
+            warned_aliases: HashSet::new(),
+            avup_samples: HashMap::new(),
+            partial_resources: HashMap::new(),
+            session_keys: HashMap::new(),
+            position: PositionTracker::new(),
+            entity_properties: HashMap::new(),
+            requests: python::Requests::default(),
+            census_in: HashMap::new(),
+            census_out: HashMap::new(),
+            census_pending: 0,
+            base_login_seen: HashSet::new(),
+            sample_counts: HashMap::new(),
+        }
+    }
 
     /// Whether this element id still has room to have a body logged at INFO.
     ///
@@ -1064,7 +1112,12 @@ impl BaseHandler {
                     // bundle reader always safely advances here.
                     let call = elt.read::<BaseEntityMethod, _>(&dispatch.base_methods)?.element.call;
                     match &call {
-                        MethodCall::Known { .. } => info!(%addr, id, "-> Base entity method: ({entity_id}) {call:?}"),
+                        MethodCall::Known { name, args } => {
+                            info!(%addr, id, "-> Base entity method: ({entity_id}) {call:?}");
+                            if let Some(meaning) = self.requests.on_base_call(name, args) {
+                                info!(target: PYTHON_TARGET, %addr, entity_id, "-> {meaning}");
+                            }
+                        }
                         MethodCall::Unknown { .. } => warn!(%addr, id, "-> Base entity method (unrecognized exposed id): ({entity_id}) {call:?}"),
                     }
                     return Ok(true);
@@ -1227,6 +1280,10 @@ impl BaseHandler {
                 // would silently resolve a new space's alias to a dead entity from the
                 // old one, for the same reason `entities` is cleared above.
                 self.id_aliases.clear();
+                // Request ids are allocated per account entity, so an answer to an
+                // outstanding request cannot arrive across a reset, and a reused id would
+                // otherwise be matched to the old request.
+                self.requests.clear();
                 self.player_entity_id = None;
 
                 // Restore player entity!
@@ -1486,31 +1543,27 @@ impl BaseHandler {
                     return Ok(true);
                 }
 
-                // TODO: onCmdResponse for requested SYNC use RES_SUCCESS=0, RES_STREAM=1, RES_CACHE=2 for result_id
-                //       When RES_STREAM is used, then a resource (header+fragment) is expected with the associated request_id.
+                // What this stream answers: the command whose `RES_STREAM` result it
+                // carries, or a predefined stream (see `python::Requests`).
+                let answers = self.requests.on_stream_complete(res_id);
+                if let Some(answers) = &answers {
+                    info!(target: PYTHON_TARGET, %addr, res_id, len = actual_total_len, "<- stream for {answers} complete");
+                }
+                let answers = answers.unwrap_or_else(|| "unknown".to_string());
 
                 // The full data is a zlib-compressed pickle. Decoded and logged in full
                 // here (rather than written to a separate dump file) so it lands in the
                 // same ordered trace as everything else.
                 match serde_pickle::value_from_reader(ZlibDecoder::new(&data[..]), serde_pickle_de_options()) {
                     Ok(val) => {
-                        info!(%addr, res_id, len = actual_total_len, crc32 = format!("0x{crc32:08X}"), python = %val,
+                        info!(%addr, res_id, answers, len = actual_total_len, crc32 = format!("0x{crc32:08X}"), python = %val,
                             "<- Resource completed");
                     }
                     Err(e) => {
-
-                        // FIXME: It appears that the current serde-pickle impl doesn't
-                        // support recursive structures, however the structure that is
-                        // initially requested with 'CMD_SYNC_DATA' contains some.
-                        // FIXME: The resource that is received by the from the chat
-                        // command contains a "deque" object, which cannot be parsed
-                        // so we get a "unresolved global reference" error.
-
                         let mut raw = Vec::new();
                         let _ = std::io::copy(&mut ZlibDecoder::new(&data[..]), &mut raw);
-                        warn!(%addr, res_id, len = actual_total_len, crc32 = format!("0x{crc32:08X}"), raw = hex(&raw),
+                        warn!(%addr, res_id, answers, len = actual_total_len, crc32 = format!("0x{crc32:08X}"), raw = hex(&raw),
                             "<- Resource completed but failed to decode as python: {e}");
-
                     }
                 }
 
@@ -1916,8 +1969,11 @@ impl BaseHandler {
                     // an `Err`.
                     let call = elt.read::<EntityMethod, _>(&dispatch.client_methods)?.element.call;
                     return Ok(match &call {
-                        MethodCall::Known { .. } => {
+                        MethodCall::Known { name, args } => {
                             info!(%addr, id, "<- Entity method: ({entity_id}) {call:?}");
+                            if let Some(meaning) = self.requests.on_client_call(name, args) {
+                                info!(target: PYTHON_TARGET, %addr, entity_id, "<- {meaning}");
+                            }
                             true
                         }
                         MethodCall::Unknown { .. } => {

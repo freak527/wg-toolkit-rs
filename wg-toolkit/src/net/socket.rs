@@ -1,14 +1,13 @@
 //! Providing an bundle-oriented socket, backed by an UDP socket.
 
-use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::{SocketAddr, UdpSocket};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::io::{self, Cursor};
 use std::time::Duration;
 
 use blowfish::Blowfish;
-
 use tracing::trace;
 
 use super::filter::{BlowfishReader, BlowfishWriter, blowfish::BLOCK_SIZE};

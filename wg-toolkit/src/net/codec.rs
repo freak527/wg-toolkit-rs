@@ -2,12 +2,12 @@
 //! types that are commonly used, such as ints, floats and various common blobs.
 
 
-use std::collections::BTreeMap;
-use std::io::{self, Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
+use std::io::{self, Read, Write};
+use std::collections::BTreeMap;
 use std::borrow::Cow;
-use std::fmt;
 use std::ops::Deref;
+use std::fmt;
 
 use glam::{Vec2, Vec3, Vec4};
 

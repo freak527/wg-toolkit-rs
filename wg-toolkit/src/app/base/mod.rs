@@ -10,10 +10,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use blowfish::Blowfish;
-
 use rand::rngs::OsRng;
 use rand::RngCore;
-
 use tracing::warn;
 
 use crate::net::bundle::{Bundle, NextElementReader, ElementReader};

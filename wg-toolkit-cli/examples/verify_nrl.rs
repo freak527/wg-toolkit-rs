@@ -8,9 +8,9 @@
 //! Usage: cargo run -p wg-toolkit-cli --features wot --example verify_nrl -- <samples-file>
 
 use std::collections::BTreeMap;
+use std::io::Cursor;
 use std::env;
 use std::fs;
-use std::io::Cursor;
 
 use wgtk::app::client::element as client_el;
 use wgtk::net::codec::SimpleCodec;
